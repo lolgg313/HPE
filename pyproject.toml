@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hpe"
 version = "1.0.0"
-description = "Next-Gen Python Game Engine with OpenGL, CustomTkinter, and Numba Optimization"
+description = "Hamid Py Engine"
 readme = "README.md"
 authors = [
     { name = "XO Aria", email = "hf18950@gmail.com" },
