@@ -11,7 +11,7 @@ authors = [
     { name = "S.U.P.E", email = "hamedsheygh3130011@gmail.com" },
     { name = "Alireza Enhessari" }
 ]
-license = { text = "MIT" }
+license = { text = "Custom License" }
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
