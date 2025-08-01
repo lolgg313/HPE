@@ -8,7 +8,6 @@ version = "1.0.0"
 description = "Hamid Py Engine"
 readme = "README.md"
 authors = [
-    { name = "XO Aria", email = "hf18950@gmail.com" },
     { name = "Alireza Enhessari" },
     { name = "S.U.P.E", email = "hamedsheygh3130011@gmail.com" }
 ]
