@@ -3,6 +3,7 @@ import os
 import shutil
 import importlib.util
 import importlib.resources
+import subprocess
 
 def show_help():
     help_text = """
@@ -24,9 +25,9 @@ Examples:
 def run_code():
     try:
         with importlib.resources.path("hpe.code", "hpe.py") as hpe_path:
-            spec = importlib.util.spec_from_file_location("hpe_module", hpe_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            result = subprocess.run([sys.executable, str(hpe_path)])
+            if result.returncode != 0:
+                print("HPE exited with error code:", result.returncode)
     except Exception as e:
         print(f"Error running HPE: {e}")
 
