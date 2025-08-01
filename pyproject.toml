@@ -9,7 +9,8 @@ description = "Hamid Py Engine"
 readme = "README.md"
 authors = [
     { name = "XO Aria", email = "hf18950@gmail.com" },
-    { name = "S.U.P.E", email = "hamedsheygh@gmail.com" }
+    { name = "Alireza Enhessari" },
+    { name = "S.U.P.E", email = "hamedsheygh3130011@gmail.com" }
 ]
 license = { text = "MIT" }
 classifiers = [
