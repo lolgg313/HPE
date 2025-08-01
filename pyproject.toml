@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hpe"
 version = "1.0.0"
-description = "Hamid Py Engine"
+description = "Personal CLI Engine with CustomTkinter, Numba & OpenGL support"
 readme = "README.md"
 authors = [
     { name = "XO Aria", email = "hf18950@gmail.com" },
@@ -13,18 +13,16 @@ authors = [
 ]
 license = { text = "MIT" }
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Topic :: Software Development :: Libraries :: Application Frameworks",
-    "Topic :: Games/Entertainment :: Simulation",
-    "Framework :: Pygame"
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Games/Entertainment :: Simulation"
 ]
 dependencies = [
     "customtkinter==5.2.2",
@@ -46,3 +44,6 @@ requires-python = ">=3.8"
 Homepage = "https://github.com/xo-aria/HPE"
 Repository = "https://github.com/xo-aria/HPE"
 Issues = "https://github.com/xo-aria/HPE/issues"
+
+[project.scripts]
+hpe = "hpe.cli:main"
