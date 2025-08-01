@@ -5,7 +5,7 @@
 
 ### Adding Scripts Path to PATH (Windows)
 
-If you encounter a "command not found" error when running `pyengine`, add the following path to your system's PATH:
+If you encounter a "command not found" error when running `hpe`, add the following path to your system's PATH:
 
 1. Find your Python Scripts path:
    ```
@@ -30,34 +30,34 @@ If you encounter a "command not found" error when running `pyengine`, add the fo
 
 | Command | Description |
 |---------|-------------|
-| `pyengine` or `pyengine help` | Show help message |
-| `pyengine run` | Execute PyEngine code |
-| `pyengine get` | Copy pyengine.py to current directory |
+| `hpe` or `hpe help` | Show help message |
+| `hpe run` | Execute hpe code |
+| `hpe get` | Copy hpe.py to current directory |
 
 ### Examples
 
 1. Show help:
 ```bash
-pyengine
+hpe
 ```
 
-2. Run PyEngine code:
+2. Run hpe code:
 ```bash
-pyengine run
+hpe run
 ```
 
 Output:
 ```
-Hello from pyengine!
-This is the main pyengine code.
+Hello from hpe!
+This is the main hpe code.
 ```
 
-3. Copy pyengine.py file:
+3. Copy hpe.py file:
 ```bash
-pyengine get
+hpe get
 ```
 
 Output:
 ```
-pyengine.py copied to: /current/directory/pyengine.py
+hpe.py copied to: /current/directory/hpe.py
 ```
