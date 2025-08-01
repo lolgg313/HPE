@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hpe"
 version = "1.0.0"
-description = "Personal CLI Engine with CustomTkinter, Numba & OpenGL support"
+description = "Hamid Py Engine"
 readme = "README.md"
 authors = [
     { name = "XO Aria", email = "hf18950@gmail.com" },
