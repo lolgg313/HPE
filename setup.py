@@ -24,8 +24,8 @@ setup(
             "hpe=hpe.cli:main",
         ],
     },
-    author="XO Aria, S.U.P.E",
-    author_email="hf18950@gmail.com, hamedsheygh@gmail.com",
+    author="XO Aria, S.U.P.E, Alireza Enhessari",
+    author_email="hf18950@gmail.com, hamedsheygh3130011@gmail.com",
     description="Hamid Py Engine",
     license="MIT",
     package_data={
