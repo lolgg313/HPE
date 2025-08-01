@@ -27,7 +27,10 @@ setup(
     author="S.U.P.E, Alireza Enhessari",
     author_email="hamedsheygh3130011@gmail.com",
     description="Hamid Py Engine",
-    license="MIT",
+    license="Hamid PY Engine License",
+    classifiers=[
+        "License :: Other/Proprietary License",
+    ],
     package_data={
         "hpe": ["code/hpe.py"],
     },
