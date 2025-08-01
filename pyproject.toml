@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpe"
-version = "1.6.0"
+version = "1.7.0"
 description = "Hamid Py Engine"
 readme = "README.md"
 authors = [
@@ -41,9 +41,9 @@ dependencies = [
 requires-python = ">=3.8"
 
 [project.urls]
-Homepage = "https://github.com/xo-aria/HPE"
-Repository = "https://github.com/xo-aria/HPE"
-Issues = "https://github.com/xo-aria/HPE/issues"
+Homepage = "https://github.com/lolgg313/HPE"
+Repository = "https://github.com/lolgg313/HPE"
+Issues = "https://github.com/lolgg313/HPE/issues"
 
 [project.scripts]
 hpe = "hpe.cli:main"
