@@ -25,7 +25,7 @@ setup(
         ],
     },
     author="S.U.P.E, Alireza Enhessari",
-    author_email="hf18950@gmail.com, hamedsheygh3130011@gmail.com",
+    author_email="hamedsheygh3130011@gmail.com",
     description="Hamid Py Engine",
     license="MIT",
     package_data={
