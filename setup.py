@@ -21,33 +21,15 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "hpe=pyengine.cli:main",
+            "hpe=hpe.cli:main",
         ],
     },
     author="XO Aria, S.U.P.E",
     author_email="hf18950@gmail.com, hamedsheygh@gmail.com",
-    description="A CLI and GUI-based Python Engine for Games and Graphics",
+    description="Hamid Py Engine",
     license="MIT",
-    url="https://github.com/xo-aria/HPE",
-    project_urls={
-        "Homepage": "https://github.com/xo-aria/HPE",
-        "Repository": "https://github.com/xo-aria/HPE",
-        "Issues": "https://github.com/xo-aria/HPE/issues",
-    },
     package_data={
-        "pyengine": ["code/pyengine.py"],
+        "hpe": ["code/hpe.py"],
     },
     python_requires=">=3.8",
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
-        "Operating System :: OS Independent",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Framework :: Pygame",
-        "Topic :: Games/Entertainment :: Simulation",
-    ],
 )
