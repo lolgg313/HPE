@@ -1,6 +1,8 @@
 ![Hamid Py Engine](hpe.jpg)
 # Hamid Py Engine ( HPE )
 
+[![PyPI Downloads](https://static.pepy.tech/badge/hpe)](https://pepy.tech/projects/hpe)
+
 ## Installation
 
 ### Adding Scripts Path to PATH (Windows)
