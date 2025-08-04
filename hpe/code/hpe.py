@@ -124,6 +124,9 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Enable antialiasing
         glEnable(GL_MULTISAMPLE)
 
+        # Setup high-quality rendering pipeline
+        self._setup_high_quality_rendering()
+
         # Enable HBAO-like ambient occlusion
         self._setup_hbao()
 
@@ -141,6 +144,97 @@ class CubeOpenGLFrame(OpenGLFrame):
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
         self._update_camera_vectors()
+
+    def _setup_high_quality_rendering(self):
+        """Setup high-quality rendering pipeline from TheHigh V1."""
+        # Enhanced lighting setup
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+
+        # High-quality sun lighting (from TheHigh V1)
+        sun_direction = [0.8, 0.7, -0.6, 0.0]  # Directional light
+        sun_color = [1.0, 0.9, 0.7, 1.0]  # Warm sun color
+        ambient_color = [0.1, 0.1, 0.1, 1.0]  # Low ambient
+
+        glLightfv(GL_LIGHT0, GL_POSITION, sun_direction)
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, sun_color)
+        glLightfv(GL_LIGHT0, GL_AMBIENT, ambient_color)
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])  # White specular
+
+        # Enhanced material properties
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+        # High-quality rendering settings
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        glEnable(GL_CULL_FACE)
+        glCullFace(GL_BACK)
+        glFrontFace(GL_CCW)
+
+        # Smooth shading for better quality
+        glShadeModel(GL_SMOOTH)
+        glEnable(GL_NORMALIZE)
+
+        # Enhanced fog for depth (from TheHigh V1)
+        glEnable(GL_FOG)
+        glFogi(GL_FOG_MODE, GL_EXP2)
+        glFogfv(GL_FOG_COLOR, [0.6, 0.7, 0.9, 1.0])  # Sky color fog
+        glFogf(GL_FOG_DENSITY, 0.01)  # Subtle fog
+        glFogf(GL_FOG_START, 10.0)
+        glFogf(GL_FOG_END, 100.0)
+
+        # High-quality texture filtering
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+
+        # Enable automatic mipmap generation
+        glGenerateMipmap(GL_TEXTURE_2D)
+
+        # Setup shadow system (from TheHigh V1)
+        self._setup_shadow_system()
+
+        print("High-quality rendering pipeline initialized")
+
+    def _setup_shadow_system(self):
+        """Setup shadow system from TheHigh V1."""
+        # Enhanced lighting for shadow casting
+        glEnable(GL_LIGHT1)  # Additional light for shadows
+
+        # Shadow casting light (sun direction from TheHigh V1)
+        shadow_light_pos = [0.8, 0.7, -0.6, 0.0]  # Directional light
+        shadow_light_color = [0.3, 0.3, 0.3, 1.0]  # Shadow color
+
+        glLightfv(GL_LIGHT1, GL_POSITION, shadow_light_pos)
+        glLightfv(GL_LIGHT1, GL_DIFFUSE, shadow_light_color)
+        glLightfv(GL_LIGHT1, GL_AMBIENT, [0.05, 0.05, 0.05, 1.0])  # Very low ambient for shadows
+
+        # Shadow properties
+        self.shadow_intensity = 0.3  # Shadow strength
+        self.shadow_softness = 8.0   # Soft shadow edges (from TheHigh V1)
+
+        print("Shadow system initialized")
+
+    def _apply_shadow_calculation(self, part):
+        """Apply shadow calculation similar to TheHigh V1."""
+        # Get object position
+        pos = part['position']
+
+        # Calculate shadow factor based on sun direction
+        sun_dir = np.array([0.8, 0.7, -0.6])  # From TheHigh V1
+        sun_dir = sun_dir / np.linalg.norm(sun_dir)
+
+        # Simple shadow calculation - objects lower get more shadow
+        height_factor = max(0.0, pos[1])  # Height above ground
+        shadow_factor = 1.0 - (self.shadow_intensity * (1.0 / (1.0 + height_factor * 0.5)))
+
+        # Apply shadow to ambient lighting
+        shadow_ambient = [shadow_factor * 0.1, shadow_factor * 0.1, shadow_factor * 0.1, 1.0]
+        glLightfv(GL_LIGHT1, GL_AMBIENT, shadow_ambient)
+
+        return shadow_factor
 
     def _setup_hbao(self):
         """Setup HBAO-like ambient occlusion using OpenGL lighting."""
@@ -1274,7 +1368,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         glLightfv(GL_LIGHT3, GL_POSITION, [-cam_right[0], -cam_right[1], -cam_right[2], 0.0])
 
     def _draw_part_with_hbao(self, part):
-        """Draw part with HBAO ambient occlusion effect."""
+        """Draw part with high-quality rendering and HBAO ambient occlusion effect."""
         if not (part['vertices'] is not None and part['faces'] is not None and \
                 len(part['vertices']) > 0 and len(part['faces']) > 0):
             return
@@ -1283,17 +1377,40 @@ class CubeOpenGLFrame(OpenGLFrame):
         world_transform = self._recompose_transform(part)
         glMultMatrixf(world_transform.T.flatten())
 
-        # Enhanced material properties for HBAO
+        # High-quality material properties (from TheHigh V1)
         base_color = part['base_color_factor']
+        is_enemy = part.get('is_enemy', False)
 
-        # Reduce ambient component for stronger AO effect
-        ambient_color = [c * 0.3 for c in base_color[:3]] + [base_color[3]]
-        diffuse_color = [c * 0.8 for c in base_color[:3]] + [base_color[3]]
+        if is_enemy:
+            # Enhanced red material for enemies with strong specular
+            ambient_color = [0.2, 0.0, 0.0, 1.0]
+            diffuse_color = [1.0, 0.1, 0.1, 1.0]
+            specular_color = [1.0, 0.5, 0.5, 1.0]
+            shininess = 64.0
+        else:
+            # High-quality material for regular objects
+            ambient_color = [c * 0.1 for c in base_color[:3]] + [base_color[3]]  # Lower ambient for better contrast
+            diffuse_color = [c * 0.9 for c in base_color[:3]] + [base_color[3]]  # Higher diffuse
+            specular_color = [0.8, 0.8, 0.8, 1.0]  # Strong white specular highlights
+            shininess = 128.0  # Sharp, realistic highlights
 
         glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, ambient_color)
         glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, diffuse_color)
-        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.1, 0.1, 0.1, 1.0])
-        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, specular_color)
+        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, shininess)
+
+        # Apply shadow calculation (from TheHigh V1)
+        shadow_factor = self._apply_shadow_calculation(part)
+
+        # Apply color for visibility with shadow consideration
+        if is_enemy:
+            # Enemy color with shadow
+            red_intensity = 1.0 * shadow_factor
+            glColor4f(red_intensity, 0.1 * shadow_factor, 0.1 * shadow_factor, 1.0)
+        else:
+            # Original color with shadow
+            shadowed_color = [c * shadow_factor for c in base_color[:3]] + [base_color[3]]
+            glColor4f(*shadowed_color)
 
         gl_tex_id_to_bind = 0
         if part['pil_image_ref'] is not None:
@@ -1367,8 +1484,10 @@ class CubeOpenGLFrame(OpenGLFrame):
         
         if name == self.active_gizmo_handle:
             glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, highlight_color)
+            glColor4f(*highlight_color)  # Explicit color for visibility
         else:
             glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, base_material)
+            glColor4f(*base_material)  # Explicit color for visibility
 
         quad = gluNewQuadric()
         
@@ -1400,8 +1519,10 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         if name == self.active_gizmo_handle:
             glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, highlight_color)
+            glColor4f(*highlight_color)  # Explicit color for visibility
         else:
             glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, base_material)
+            glColor4f(*base_material)  # Explicit color for visibility
         
         glPushMatrix()
         
@@ -1557,9 +1678,9 @@ class App(ctk.CTk):
         # Redirect print statements to console
         self._setup_console_redirect()
 
-        # Initialize default colors
-        self.sun_color = [1.0, 1.0, 0.95, 1.0]  # Default sun color
-        self.sky_color = [0.53, 0.81, 0.92, 1.0]  # Default sky color
+        # Initialize default colors (from TheHigh V1)
+        self.sun_color = [1.0, 0.9, 0.7, 1.0]  # Warm sun color
+        self.sky_color = [0.6, 0.7, 0.9, 1.0]  # Beautiful sky color from TheHigh V1
         self.halo_color = [1.0, 0.9, 0.7, 0.15]  # Default halo color
 
         # Physics system
