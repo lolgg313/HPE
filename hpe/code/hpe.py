@@ -18,6 +18,7 @@ import customtkinter as ctk
 from customtkinter import filedialog
 from OpenGL.GL import *
 from OpenGL.GLU import *
+from OpenGL.arrays import vbo
 from pyopengltk import OpenGLFrame
 import numpy as np
 import trimesh
@@ -30,11 +31,225 @@ import os # For file operations
 import numba
 from numba import jit
 import time
+import ctypes
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pygame
 pygame.init()
 if pygame.display.get_init():
     pygame.display.quit()
+
+# --- Helper GLSL Shader Compilation Functions ---
+def compile_shader(source, shader_type):
+    shader = glCreateShader(shader_type)
+    glShaderSource(shader, source)
+    glCompileShader(shader)
+    if not glGetShaderiv(shader, GL_COMPILE_STATUS):
+        error_type = "Vertex" if shader_type == GL_VERTEX_SHADER else "Fragment"
+        error = glGetShaderInfoLog(shader).decode()
+        print(f"ERROR: {error_type} shader compilation error:\n{error}")
+        glDeleteShader(shader); raise RuntimeError(f"{error_type} shader compilation failed: {error}")
+    return shader
+
+def create_shader_program(vertex_source, fragment_source):
+    vertex_shader = compile_shader(vertex_source, GL_VERTEX_SHADER)
+    fragment_shader = compile_shader(fragment_source, GL_FRAGMENT_SHADER)
+    program = glCreateProgram()
+    glAttachShader(program, vertex_shader); glAttachShader(program, fragment_shader)
+    glLinkProgram(program)
+    if not glGetProgramiv(program, GL_LINK_STATUS):
+        error = glGetProgramInfoLog(program).decode()
+        print(f"ERROR: Program linking error:\n{error}")
+        glDeleteProgram(program); glDeleteShader(vertex_shader); glDeleteShader(fragment_shader)
+        raise RuntimeError(f"Shader program linking failed: {error}")
+    glDeleteShader(vertex_shader); glDeleteShader(fragment_shader)
+    return program
+
+# --- Procedural Sky & Clouds GLSL Function Source ---
+PROCEDURAL_SKY_CLOUDS_FUNC_SRC = """
+// Pseudo-random generator (simple hash)
+float rand(vec2 co){
+    return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+}
+
+// Basic value noise function
+float noise(vec2 st) {
+    vec2 i = floor(st);
+    vec2 f = fract(st);
+    // Smooth interpolation (smoothstep)
+    vec2 u = f * f * (3.0 - 2.0 * f);
+
+    float a = rand(i);
+    float b = rand(i + vec2(1.0, 0.0));
+    float c = rand(i + vec2(0.0, 1.0));
+    float d = rand(i + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Fractal Brownian Motion (FBM)
+float fbm(vec2 st, int octaves, float persistence, float lacunarity) {
+    float total = 0.0;
+    float frequency = 1.0;
+    float amplitude = 1.0;
+    float maxValue = 0.0;
+    for (int i = 0; i < octaves; i++) {
+        total += noise(st * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+    if (maxValue == 0.0) return 0.0; // Avoid division by zero
+    return total / maxValue; // Normalize to 0-1 range
+}
+
+// --- Cloud and Sky Appearance Constants ---
+const vec3 SKY_COLOR_ZENITH = vec3(0.15, 0.35, 0.7);
+const vec3 SKY_COLOR_HORIZON = vec3(0.4, 0.6, 0.85);
+const vec3 SUN_COLOR_EFFECT = vec3(1.0, 0.9, 0.7);
+
+const float CLOUD_SCALE = 1.3;
+const vec2 CLOUD_SCROLL_SPEED = vec2(0.015, 0.008);
+const int CLOUD_OCTAVES = 5;
+const float CLOUD_PERSISTENCE = 0.45;
+const float CLOUD_LACUNARITY = 2.1;
+const float CLOUD_COVERAGE_FACTOR = 0.45;
+const float CLOUD_SHARPNESS = 0.3;
+const float CLOUD_DENSITY_FACTOR = 0.6;
+
+const vec3 CLOUD_COLOR_LIGHT = vec3(0.95, 0.95, 1.0);
+const vec3 CLOUD_COLOR_DARK_BASE = vec3(0.65, 0.7, 0.75);
+const float SUN_DISK_INTENSITY = 35.0;
+const float SUN_HAZE_INTENSITY = 0.15;
+
+// Main function to get procedural sky and cloud color
+vec3 getProceduralSkyAndCloudsColor(vec3 viewDirWorld, float currentTime, vec3 sunDirectionWorld) {
+    vec3 normViewDir = normalize(viewDirWorld);
+
+    // 1. Base Sky Gradient
+    float T = pow(max(0.0, normViewDir.y), 0.5);
+    vec3 skyGradient = mix(SKY_COLOR_HORIZON, SKY_COLOR_ZENITH, T);
+
+    // 2. Cloud Layer
+    vec2 cloudUV = normViewDir.xz / (abs(normViewDir.y) * 0.5 + 0.1 + 0.0001);
+    cloudUV *= CLOUD_SCALE;
+    cloudUV += currentTime * CLOUD_SCROLL_SPEED;
+
+    float cloudNoiseVal = fbm(cloudUV, CLOUD_OCTAVES, CLOUD_PERSISTENCE, CLOUD_LACUNARITY);
+
+    float cloudCoverageThreshold = 1.0 - CLOUD_COVERAGE_FACTOR;
+    float cloudMap = smoothstep(cloudCoverageThreshold - CLOUD_SHARPNESS, cloudCoverageThreshold + CLOUD_SHARPNESS, cloudNoiseVal);
+    cloudMap *= CLOUD_DENSITY_FACTOR;
+
+    // 3. Cloud Lighting
+    float viewSunDot = max(0.0, dot(normViewDir, sunDirectionWorld));
+    float cloudLightDot = max(0.0, dot(vec3(0.1, 0.9, 0.1), sunDirectionWorld));
+    cloudLightDot = mix(0.4, 1.0, cloudLightDot);
+
+    vec3 cloudColor = mix(CLOUD_COLOR_DARK_BASE, CLOUD_COLOR_LIGHT, cloudLightDot);
+    cloudColor += SUN_COLOR_EFFECT * pow(viewSunDot, 8.0) * 0.5 * cloudMap;
+
+    // 4. Sun Disk / Haze
+    float sunDot = max(0.0, dot(normViewDir, sunDirectionWorld));
+    vec3 sunDisk = SUN_COLOR_EFFECT * pow(sunDot, SUN_DISK_INTENSITY);
+    vec3 sunHaze = SUN_COLOR_EFFECT * pow(sunDot, 2.0) * SUN_HAZE_INTENSITY;
+
+    // 5. Composite Final Color
+    vec3 finalColor = mix(skyGradient, cloudColor, cloudMap);
+    finalColor += sunHaze;
+    finalColor += sunDisk;
+
+    return finalColor;
+}
+"""
+
+# --- Sky Shader Definitions ---
+SKY_VERTEX_SHADER_SRC = """
+#version 330 core
+layout (location = 0) in vec2 aPos;
+
+uniform mat4 invProjectionMatrix;
+uniform mat4 invViewMatrix;
+
+out vec3 v_WorldSpaceViewDir;
+
+void main() {
+    vec4 ray_clip = vec4(aPos.x, aPos.y, -1.0, 1.0);
+    vec4 ray_eye = invProjectionMatrix * ray_clip;
+    ray_eye = vec4(ray_eye.xy, -1.0, 0.0);
+    v_WorldSpaceViewDir = mat3(invViewMatrix) * ray_eye.xyz;
+    gl_Position = vec4(aPos.x, aPos.y, 0.99999, 1.0);
+}
+"""
+
+SKY_FRAGMENT_SHADER_SRC = """#version 330 core
+out vec4 FragColor;
+
+// --- Inserted Procedural Sky & Clouds Functions ---
+""" + PROCEDURAL_SKY_CLOUDS_FUNC_SRC + """
+// --- End of Inserted Functions ---
+
+in vec3 v_WorldSpaceViewDir;
+
+uniform float time;
+uniform vec3 sunDirection_World;
+
+void main() {
+    vec3 viewDir = normalize(v_WorldSpaceViewDir);
+    vec3 skyAndCloudColor = getProceduralSkyAndCloudsColor(viewDir, time, sunDirection_World);
+    FragColor = vec4(skyAndCloudColor, 1.0);
+}
+"""
+
+# --- SkyRenderer Class ---
+class SkyRenderer:
+    def __init__(self):
+        self.shader_program = None
+        self.VAO = None
+        self.VBO = None
+        self.quad_vertices = np.array([
+            -1.0,  1.0,
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+        ], dtype=np.float32)
+
+        self._setup_mesh()
+        self._setup_shaders()
+
+    def _setup_mesh(self):
+        self.VAO = glGenVertexArrays(1)
+        glBindVertexArray(self.VAO)
+        self.VBO = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
+        glBufferData(GL_ARRAY_BUFFER, self.quad_vertices.nbytes, self.quad_vertices, GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * 4, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glBindVertexArray(0)
+
+    def _setup_shaders(self):
+        self.shader_program = create_shader_program(SKY_VERTEX_SHADER_SRC, SKY_FRAGMENT_SHADER_SRC)
+        self.invProjectionMatrix_loc = glGetUniformLocation(self.shader_program, "invProjectionMatrix")
+        self.invViewMatrix_loc = glGetUniformLocation(self.shader_program, "invViewMatrix")
+        self.time_loc = glGetUniformLocation(self.shader_program, "time")
+        self.sunDirection_loc = glGetUniformLocation(self.shader_program, "sunDirection_World")
+
+    def draw(self, inv_projection_matrix, inv_view_matrix, current_time, sun_direction_world):
+        glUseProgram(self.shader_program)
+        glUniformMatrix4fv(self.invProjectionMatrix_loc, 1, GL_FALSE, inv_projection_matrix)
+        glUniformMatrix4fv(self.invViewMatrix_loc, 1, GL_FALSE, inv_view_matrix)
+        glUniform1f(self.time_loc, current_time)
+        glUniform3fv(self.sunDirection_loc, 1, sun_direction_world)
+
+        glBindVertexArray(self.VAO)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+        glBindVertexArray(0)
+        glUseProgram(0)
 
 class CubeOpenGLFrame(OpenGLFrame):
     def __init__(self, master, app, *args, **kw):
@@ -93,8 +308,22 @@ class CubeOpenGLFrame(OpenGLFrame):
         # --- Model and Texture Data Structures ---
         self.model_loaded = False
         self.model_draw_list = []
-        self.opengl_texture_map = {} 
+        self.opengl_texture_map = {}
         self.pil_images_awaiting_gl_upload = {}
+
+        # --- Sky Renderer and Time Tracking ---
+        self.sky_renderer = None
+        self.start_time = 0.0
+        self.current_time_gl = 0.0
+
+        # --- Threading Infrastructure ---
+        self.thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="GLFrame")
+        self.texture_queue = queue.Queue()
+        self.mesh_processing_queue = queue.Queue()
+        self.physics_queue = queue.Queue()
+        self.loading_lock = threading.Lock()
+        self.texture_lock = threading.Lock()
+        self.physics_lock = threading.Lock()
 
         # --- Bind mouse and keyboard events ---
         self.bind("<ButtonPress-1>", self.on_lmb_press)
@@ -144,6 +373,10 @@ class CubeOpenGLFrame(OpenGLFrame):
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
         self._update_camera_vectors()
+
+        # Initialize sky renderer
+        self.sky_renderer = SkyRenderer()
+        self.start_time = time.time()
 
     def _setup_high_quality_rendering(self):
         """Setup high-quality rendering pipeline from TheHigh V1."""
@@ -704,7 +937,7 @@ class CubeOpenGLFrame(OpenGLFrame):
 
     def _generate_gl_texture_for_image(self, pil_image_obj):
         try:
-            img = pil_image_obj.convert("RGBA") 
+            img = pil_image_obj.convert("RGBA")
             img_data = img.tobytes("raw", "RGBA", 0, -1)
             width, height = img.size
             gl_tex_id = glGenTextures(1)
@@ -719,13 +952,146 @@ class CubeOpenGLFrame(OpenGLFrame):
             print(f"Error creating OpenGL texture: {e}")
             return 0
 
+    def _prepare_texture_data_threaded(self, img_id, pil_img):
+        """Prepare texture data in background thread (CPU-only operations)."""
+        try:
+            img = pil_img.convert("RGBA")
+            img_data = img.tobytes("raw", "RGBA", 0, -1)
+            width, height = img.size
+            return {
+                'img_id': img_id,
+                'img_data': img_data,
+                'width': width,
+                'height': height,
+                'success': True
+            }
+        except Exception as e:
+            print(f"Error preparing texture data: {e}")
+            return {'img_id': img_id, 'success': False, 'error': str(e)}
+
     def _create_and_cache_missing_gl_textures(self):
-        if not self.pil_images_awaiting_gl_upload: return
+        if not self.pil_images_awaiting_gl_upload:
+            # Process any completed texture preparations
+            self._process_completed_texture_preparations()
+            return
+
         images_to_process = list(self.pil_images_awaiting_gl_upload.items())
-        self.pil_images_awaiting_gl_upload.clear() 
-        for img_id, pil_img in images_to_process:
-            if img_id not in self.opengl_texture_map:
-                self.opengl_texture_map[img_id] = self._generate_gl_texture_for_image(pil_img)
+        self.pil_images_awaiting_gl_upload.clear()
+
+        # Submit texture preparation tasks to thread pool
+        with self.texture_lock:
+            for img_id, pil_img in images_to_process:
+                if img_id not in self.opengl_texture_map:
+                    # Submit CPU-intensive texture preparation to thread pool
+                    future = self.thread_pool.submit(self._prepare_texture_data_threaded, img_id, pil_img)
+                    self.texture_queue.put(future)
+
+        # Process any completed texture preparations
+        self._process_completed_texture_preparations()
+
+    def _process_completed_texture_preparations(self):
+        """Process completed texture preparation tasks and create OpenGL textures."""
+        completed_textures = []
+
+        # Check for completed texture preparation tasks
+        while not self.texture_queue.empty():
+            try:
+                future = self.texture_queue.get_nowait()
+                if future.done():
+                    completed_textures.append(future)
+                else:
+                    # Put back if not done
+                    self.texture_queue.put(future)
+                    break
+            except queue.Empty:
+                break
+
+        # Create OpenGL textures for completed preparations
+        for future in completed_textures:
+            try:
+                texture_data = future.result()
+                if texture_data['success']:
+                    img_id = texture_data['img_id']
+                    if img_id not in self.opengl_texture_map:
+                        # Create OpenGL texture (must be done on main thread)
+                        gl_tex_id = glGenTextures(1)
+                        glBindTexture(GL_TEXTURE_2D, gl_tex_id)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                                   texture_data['width'], texture_data['height'],
+                                   0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data['img_data'])
+                        glGenerateMipmap(GL_TEXTURE_2D)
+                        glBindTexture(GL_TEXTURE_2D, 0)
+                        self.opengl_texture_map[img_id] = gl_tex_id
+                else:
+                    print(f"Texture preparation failed: {texture_data.get('error', 'Unknown error')}")
+            except Exception as e:
+                print(f"Error processing completed texture: {e}")
+
+    def _process_mesh_normals_threaded(self, mesh_obj):
+        """Process mesh normals in background thread."""
+        try:
+            if not hasattr(mesh_obj, 'vertex_normals') or len(mesh_obj.vertex_normals) != len(mesh_obj.vertices):
+                mesh_obj.fix_normals()
+            return mesh_obj
+        except Exception as e:
+            print(f"Error processing mesh normals: {e}")
+            return mesh_obj
+
+    def _calculate_rigidbody_physics_threaded(self, physics_obj, dt):
+        """Calculate rigidbody physics in background thread."""
+        try:
+            # Create a copy to avoid thread safety issues
+            obj_copy = {
+                'position': physics_obj['position'].copy(),
+                'velocity': physics_obj['velocity'].copy(),
+                'angular_velocity': physics_obj['angular_velocity'].copy(),
+                'mass': physics_obj['mass'],
+                'stability_factor': physics_obj['stability_factor'],
+                'bounds': physics_obj['bounds'].copy()
+            }
+
+            # Apply gravity scaled by mass
+            gravity_force = obj_copy['mass'] * 9.81
+            obj_copy['velocity'][1] -= gravity_force * dt
+
+            # Apply velocity damping (air resistance)
+            damping = 0.98
+            obj_copy['velocity'] *= damping
+            obj_copy['angular_velocity'] *= damping
+
+            # Update position
+            obj_copy['position'] += obj_copy['velocity'] * dt
+
+            # Ground collision check
+            ground_level = 0.0
+            if obj_copy['position'][1] <= ground_level:
+                obj_copy['position'][1] = ground_level
+                obj_copy['velocity'][1] = 0.0
+
+                # Add some bounce for realism
+                if abs(obj_copy['velocity'][1]) > 0.1:
+                    obj_copy['velocity'][1] = -obj_copy['velocity'][1] * 0.3
+
+            return {
+                'position': obj_copy['position'],
+                'velocity': obj_copy['velocity'],
+                'angular_velocity': obj_copy['angular_velocity']
+            }
+        except Exception as e:
+            print(f"Error in threaded physics calculation: {e}")
+            return None
+
+    def _calculate_inverse_matrices(self, projection_matrix, view_matrix):
+        """Calculate inverse matrices in background thread."""
+        try:
+            inv_projection = np.linalg.inv(projection_matrix)
+            inv_view = np.linalg.inv(view_matrix)
+            return inv_projection, inv_view
+        except np.linalg.LinAlgError as e:
+            print(f"Matrix inversion error in thread: {e}")
+            raise
 
     def _process_mesh_for_drawing(self, mesh_obj, world_transform, geom_name_hint="mesh_part"):
         if not hasattr(mesh_obj, 'vertices') or len(mesh_obj.vertices) == 0: return
@@ -735,8 +1101,9 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         if mesh_obj.faces.shape[1] != 3: return
 
-        if not hasattr(mesh_obj, 'vertex_normals') or len(mesh_obj.vertex_normals) != len(mesh_obj.vertices):
-            mesh_obj.fix_normals()
+        # Submit heavy mesh processing to thread pool
+        future = self.thread_pool.submit(self._process_mesh_normals_threaded, mesh_obj)
+        mesh_obj = future.result()  # Wait for completion since we need the result immediately
 
         texcoords, pil_image_ref, base_color_factor, vertex_colors_array, is_transparent_part = (None,)*5
         base_color_factor = [0.8, 0.8, 0.8, 1.0]
@@ -783,37 +1150,64 @@ class CubeOpenGLFrame(OpenGLFrame):
         self.gizmo_handle_meshes.clear()
         self._update_properties_panel()
 
+        # Submit heavy model loading to thread pool
+        future = self.thread_pool.submit(self._load_model_threaded, filepath)
+
+        # Show loading indicator
+        print("Loading model in background thread...")
+
+        # Process the loaded model when ready
+        self.after(100, lambda: self._check_model_loading_complete(future, filepath))
+
+    def _load_model_threaded(self, filepath):
+        """Load model file in background thread."""
         try:
             # Use force='mesh' to combine all geometries into a single mesh object.
             # This aligns with the "treat 3D model as a single object" requirement.
             combined_mesh = trimesh.load(filepath, force='mesh', process=True)
-
-            if isinstance(combined_mesh, trimesh.Trimesh) and not combined_mesh.is_empty:
-                identity_transform = np.eye(4, dtype=np.float32)
-                self._process_mesh_for_drawing(combined_mesh, identity_transform, "imported_model")
-
-                # Store the original file path in the newly added object
-                if self.model_draw_list:
-                    self.model_draw_list[-1]['model_file'] = filepath
-
-                # Auto-select the newly loaded model
-                self.selected_part_index = len(self.model_draw_list) - 1
-                self._update_gizmo_collision_meshes()
-                self._update_properties_panel()
-
-                # Update hierarchy list
-                if hasattr(self.app, 'update_hierarchy_list'):
-                    self.app.update_hierarchy_list()
-
-                self.model_loaded = True
-                print(f"--- Model processing complete. Added to scene. Total parts: {len(self.model_draw_list)} ---")
-            else:
-                print("Warning: Loaded model is empty or could not be loaded as a single mesh.")
-
+            return {'success': True, 'mesh': combined_mesh, 'filepath': filepath}
         except Exception as e:
-            print(f"FATAL Error loading model: {e}")
-            traceback.print_exc()
-        self.event_generate("<Expose>")
+            return {'success': False, 'error': str(e), 'filepath': filepath}
+
+    def _check_model_loading_complete(self, future, filepath):
+        """Check if model loading is complete and process result."""
+        if future.done():
+            try:
+                result = future.result()
+                if result['success']:
+                    combined_mesh = result['mesh']
+
+                    if isinstance(combined_mesh, trimesh.Trimesh) and not combined_mesh.is_empty:
+                        identity_transform = np.eye(4, dtype=np.float32)
+                        self._process_mesh_for_drawing(combined_mesh, identity_transform, "imported_model")
+
+                        # Store the original file path in the newly added object
+                        if self.model_draw_list:
+                            self.model_draw_list[-1]['model_file'] = filepath
+
+                        # Auto-select the newly loaded model
+                        self.selected_part_index = len(self.model_draw_list) - 1
+                        self._update_gizmo_collision_meshes()
+                        self._update_properties_panel()
+
+                        # Update hierarchy list
+                        if hasattr(self.app, 'update_hierarchy_list'):
+                            self.app.update_hierarchy_list()
+
+                        self.model_loaded = True
+                        print(f"--- Model processing complete. Added to scene. Total parts: {len(self.model_draw_list)} ---")
+                    else:
+                        print("Warning: Loaded model is empty or could not be loaded as a single mesh.")
+                else:
+                    print(f"FATAL Error loading model: {result['error']}")
+
+                self.event_generate("<Expose>")
+            except Exception as e:
+                print(f"Error processing loaded model: {e}")
+                traceback.print_exc()
+        else:
+            # Still loading, check again later
+            self.after(100, lambda: self._check_model_loading_complete(future, filepath))
 
     # -------------------------------------------------------------------
     # Duplicate and Delete actions
@@ -1302,6 +1696,10 @@ class CubeOpenGLFrame(OpenGLFrame):
 
     def _draw_sun(self):
         """Draws a realistic 3D sun in the sky."""
+        # Check if sun is visible
+        if not getattr(self.app, 'sun_visible', True):
+            return
+
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glEnable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
@@ -1561,14 +1959,60 @@ class CubeOpenGLFrame(OpenGLFrame):
     def redraw(self):
         self._create_and_cache_missing_gl_textures()
 
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glMatrixMode(GL_MODELVIEW) 
-        glLoadIdentity()
+        # Update time for cloud animation
+        self.current_time_gl = time.time() - self.start_time
 
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        # Setup projection matrix
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        aspect_ratio = self.width / self.height if self.height > 0 else 1.0
+        gluPerspective(45, aspect_ratio, 0.5, 5000.0)
+        projection_matrix_gl = glGetFloatv(GL_PROJECTION_MATRIX)
+
+        # Setup view matrix
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
         look_at_point = self.camera_pos + self.camera_front
         gluLookAt(self.camera_pos[0], self.camera_pos[1], self.camera_pos[2],
                   look_at_point[0], look_at_point[1], look_at_point[2],
                   self.camera_up[0], self.camera_up[1], self.camera_up[2])
+        view_matrix_gl = glGetFloatv(GL_MODELVIEW_MATRIX)
+
+        # Render sky with clouds if sky renderer is available
+        if self.sky_renderer is not None:
+            try:
+                # Submit matrix inversion to thread pool for heavy computation
+                matrix_future = self.thread_pool.submit(self._calculate_inverse_matrices, projection_matrix_gl, view_matrix_gl)
+
+                # Try to get result quickly, fall back to direct calculation if needed
+                try:
+                    inv_projection_matrix, inv_view_matrix = matrix_future.result(timeout=0.005)  # 5ms timeout
+                except:
+                    # Fall back to direct calculation
+                    inv_projection_matrix = np.linalg.inv(projection_matrix_gl)
+                    inv_view_matrix = np.linalg.inv(view_matrix_gl)
+
+                # Sun direction for lighting (same as used in lighting setup)
+                sun_direction_world = np.array([0.8, 0.7, -0.6], dtype=np.float32)
+                norm = np.linalg.norm(sun_direction_world)
+                if norm > 1e-6:
+                    sun_direction_world /= norm
+                else:
+                    sun_direction_world = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                # Render sky behind everything
+                glDepthMask(GL_FALSE)
+                self.sky_renderer.draw(
+                    inv_projection_matrix,
+                    inv_view_matrix,
+                    self.current_time_gl,
+                    sun_direction_world
+                )
+                glDepthMask(GL_TRUE)
+            except np.linalg.LinAlgError:
+                print("ERROR: Could not invert projection/view matrix for sky rendering.")
 
         self._draw_world_origin_gizmo()
         self._draw_sun()
@@ -1604,11 +2048,22 @@ class CubeOpenGLFrame(OpenGLFrame):
         print("Cleaning up GL resources...")
         self._cleanup_old_model_resources()
 
+        # Cleanup threading resources
+        try:
+            print("Shutting down thread pool...")
+            self.thread_pool.shutdown(wait=True, timeout=2.0)
+            print("Thread pool shutdown complete.")
+        except Exception as e:
+            print(f"Error shutting down thread pool: {e}")
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Hamid PY Engine V1.4")
         self.geometry("1200x850")
+
+        # Initialize sun visibility BEFORE UI creation
+        self.sun_visible = True
 
         # --- Main Layout ---
         self.grid_columnconfigure(1, weight=1)  # Middle column (OpenGL) gets the weight
@@ -1640,6 +2095,17 @@ class App(ctk.CTk):
 
         self.sun_color_button = ctk.CTkButton(top_frame, text="Sun Color", command=self.choose_sun_color, width=80)
         self.sun_color_button.pack(side="left", padx=5)
+
+        # Sun visibility checkbox (use initialized sun_visible state)
+        self.sun_visible_var = ctk.BooleanVar(value=self.sun_visible)
+        self.sun_visible_checkbox = ctk.CTkCheckBox(
+            top_frame,
+            text="Show Sun",
+            variable=self.sun_visible_var,
+            command=self.toggle_sun_visibility,
+            width=80
+        )
+        self.sun_visible_checkbox.pack(side="left", padx=5)
 
         # Terrain Editor button
         self.terrain_button = ctk.CTkButton(top_frame, text="Terrain Editor", command=self.open_terrain_editor, width=100)
@@ -1678,6 +2144,9 @@ class App(ctk.CTk):
         # Redirect print statements to console
         self._setup_console_redirect()
 
+        # Initialize button states based on sun visibility
+        self.after(100, self._initialize_sun_button_states)
+
         # Initialize default colors (from TheHigh V1)
         self.sun_color = [1.0, 0.9, 0.7, 1.0]  # Warm sun color
         self.sky_color = [0.6, 0.7, 0.9, 1.0]  # Beautiful sky color from TheHigh V1
@@ -1712,30 +2181,49 @@ class App(ctk.CTk):
                 self.original_stdout = sys.stdout
 
             def write(self, text):
-                if text.strip():  # Only show non-empty messages
-                    # Schedule GUI update in main thread
-                    self.console_widget.after(0, self._update_console, text.strip())
+                try:
+                    if text.strip() and self.console_widget:  # Only show non-empty messages
+                        # Schedule GUI update in main thread
+                        self.console_widget.after(0, self._update_console, text.strip())
+                except Exception as e:
+                    # Fallback to original stdout if console fails
+                    pass
                 # Also write to original stdout for debugging
-                self.original_stdout.write(text)
+                if self.original_stdout:
+                    self.original_stdout.write(text)
 
             def flush(self):
-                self.original_stdout.flush()
+                try:
+                    if self.original_stdout:
+                        self.original_stdout.flush()
+                except Exception:
+                    pass
 
             def _update_console(self, text):
-                # Insert text at end
-                self.console_widget.insert("end", text + "\n")
-                # Auto-scroll to bottom
-                self.console_widget.see("end")
-                # Limit console to last 100 lines
-                lines = self.console_widget.get("1.0", "end").split('\n')
-                if len(lines) > 100:
-                    self.console_widget.delete("1.0", f"{len(lines)-100}.0")
+                try:
+                    if self.console_widget and hasattr(self.console_widget, 'insert'):
+                        # Insert text at end
+                        self.console_widget.insert("end", text + "\n")
+                        # Auto-scroll to bottom
+                        self.console_widget.see("end")
+                        # Limit console to last 100 lines
+                        lines = self.console_widget.get("1.0", "end").split('\n')
+                        if len(lines) > 100:
+                            self.console_widget.delete("1.0", f"{len(lines)-100}.0")
+                except Exception as e:
+                    # Silently fail if console is not available
+                    pass
 
         # Redirect stdout to console
-        sys.stdout = ConsoleRedirect(self.console_text)
-
-        # Add welcome message
-        print("FreeFly Game Engine Console - Ready")
+        try:
+            if hasattr(self, 'console_text') and self.console_text:
+                sys.stdout = ConsoleRedirect(self.console_text)
+                # Add welcome message
+                print("FreeFly Game Engine Console - Ready")
+            else:
+                print("Warning: Console widget not available, using standard output")
+        except Exception as e:
+            print(f"Warning: Could not setup console redirect: {e}")
 
     def create_menu_bar(self):
         """Creates a Unity-like menu bar with File, Edit, View, and Help menus."""
@@ -1947,6 +2435,10 @@ class App(ctk.CTk):
 
     def choose_sun_color(self):
         """Opens color picker for sun color."""
+        if not self.sun_visible:
+            print("Cannot change sun color when sun is disabled")
+            return
+
         import tkinter.colorchooser as colorchooser
 
         # Convert current color to hex for color picker
@@ -1977,6 +2469,10 @@ class App(ctk.CTk):
 
     def choose_halo_color(self):
         """Opens color picker for halo color."""
+        if not self.sun_visible:
+            print("Cannot change halo color when sun is disabled")
+            return
+
         import tkinter.colorchooser as colorchooser
 
         # Convert current color to hex for color picker
@@ -1989,6 +2485,69 @@ class App(ctk.CTk):
             self.halo_color = [c/255.0 for c in color[0]] + [self.halo_color[3]]  # Keep alpha
             print(f"Halo color changed to: {self.halo_color}")
 
+    def toggle_sun_visibility(self):
+        """Toggle sun and halo visibility and update button states."""
+        try:
+            # Get sun visibility state safely
+            if hasattr(self, 'sun_visible_var') and self.sun_visible_var is not None:
+                new_state = self.sun_visible_var.get()
+                print(f"DEBUG: Checkbox state changed to: {new_state}")
+                self.sun_visible = new_state
+            else:
+                # If checkbox var doesn't exist, keep current state
+                self.sun_visible = getattr(self, 'sun_visible', True)
+                print(f"Warning: sun_visible_var not available, using current state: {self.sun_visible}")
+
+            print(f"DEBUG: Sun visibility is now: {self.sun_visible}")
+
+            # Update button states based on sun visibility
+            if self.sun_visible:
+                # Enable sun and halo color buttons
+                if hasattr(self, 'sun_color_button'):
+                    self.sun_color_button.configure(state="normal")
+                if hasattr(self, 'halo_color_button'):
+                    self.halo_color_button.configure(state="normal")
+                print("Sun and halo enabled")
+            else:
+                # Disable sun and halo color buttons
+                if hasattr(self, 'sun_color_button'):
+                    self.sun_color_button.configure(state="disabled")
+                if hasattr(self, 'halo_color_button'):
+                    self.halo_color_button.configure(state="disabled")
+                print("Sun and halo disabled")
+
+            # Force redraw to update the scene
+            if hasattr(self, 'gl_frame') and self.gl_frame:
+                self.gl_frame.event_generate("<Expose>")
+
+        except Exception as e:
+            print(f"Error toggling sun visibility: {e}")
+            import traceback
+            traceback.print_exc()
+            # Reset to safe state
+            self.sun_visible = True
+
+    def _initialize_sun_button_states(self):
+        """Initialize sun and halo button states based on sun visibility."""
+        try:
+            print(f"Initializing sun button states. sun_visible: {self.sun_visible}")
+
+            # Set initial checkbox state if checkbox exists
+            if hasattr(self, 'sun_visible_var') and self.sun_visible_var is not None:
+                self.sun_visible_var.set(self.sun_visible)
+                print(f"Set checkbox to: {self.sun_visible}")
+
+            # Update button states
+            if hasattr(self, 'sun_color_button') and hasattr(self, 'halo_color_button'):
+                self.toggle_sun_visibility()
+            else:
+                print("Sun/halo buttons not ready yet")
+
+        except Exception as e:
+            print(f"Warning: Could not initialize sun button states: {e}")
+            import traceback
+            traceback.print_exc()
+
     def create_cube(self):
         """Creates a cube primitive."""
         cube_mesh = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
@@ -1996,8 +2555,32 @@ class App(ctk.CTk):
 
     def create_sphere(self):
         """Creates a sphere primitive."""
-        sphere_mesh = trimesh.creation.uv_sphere(radius=1.0, count=[32, 16])
-        self._add_primitive_to_scene(sphere_mesh, "Sphere")
+        # Submit heavy mesh creation to thread pool
+        future = self.gl_frame.thread_pool.submit(self._create_sphere_threaded)
+        self.after(50, lambda: self._check_primitive_creation_complete(future, "Sphere"))
+
+    def _create_sphere_threaded(self):
+        """Create sphere mesh in background thread."""
+        try:
+            return {'success': True, 'mesh': trimesh.creation.uv_sphere(radius=1.0, count=[32, 16])}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _check_primitive_creation_complete(self, future, primitive_name):
+        """Check if primitive creation is complete and add to scene."""
+        if future.done():
+            try:
+                result = future.result()
+                if result['success']:
+                    self._add_primitive_to_scene(result['mesh'], primitive_name)
+                    print(f"{primitive_name} created successfully")
+                else:
+                    print(f"Error creating {primitive_name}: {result['error']}")
+            except Exception as e:
+                print(f"Error processing {primitive_name} creation: {e}")
+        else:
+            # Still processing, check again later
+            self.after(50, lambda: self._check_primitive_creation_complete(future, primitive_name))
 
     def create_cone(self):
         """Creates a cone primitive."""
@@ -2475,9 +3058,29 @@ class App(ctk.CTk):
         dt = min(current_time - self.last_physics_time, 0.033)  # Cap at 30 FPS
         self.last_physics_time = current_time
 
-        # Update rigid body physics
-        for physics_obj in self.physics_objects:
-            if physics_obj['type'] == 'RigidBody':
+        # Update rigid body physics with threading for many objects
+        rigidbody_objects = [obj for obj in self.physics_objects if obj['type'] == 'RigidBody']
+
+        if len(rigidbody_objects) > 6:  # Use threading for many objects
+            # Submit physics calculations to thread pool
+            futures = []
+            for physics_obj in rigidbody_objects:
+                future = self.thread_pool.submit(self._calculate_rigidbody_physics_threaded, physics_obj, dt)
+                futures.append((future, physics_obj))
+
+            # Collect results
+            for future, physics_obj in futures:
+                try:
+                    result = future.result(timeout=0.016)  # 16ms timeout
+                    if result:
+                        physics_obj.update(result)
+                except Exception as e:
+                    print(f"Physics calculation timeout or error: {e}")
+                    # Fall back to direct calculation
+                    self._update_rigidbody_physics(physics_obj, dt)
+        else:
+            # Direct calculation for few objects
+            for physics_obj in rigidbody_objects:
                 self._update_rigidbody_physics(physics_obj, dt)
 
         # Check object-to-object collisions
@@ -2775,10 +3378,16 @@ class App(ctk.CTk):
 
     def _check_object_collisions(self):
         """Check for collisions between physics objects."""
-        for i, obj1 in enumerate(self.physics_objects):
-            if obj1['type'] != 'RigidBody':
-                continue
+        rigidbody_objects = [obj for obj in self.physics_objects if obj['type'] == 'RigidBody']
 
+        if len(rigidbody_objects) > 8:  # Use threading for many objects
+            self._check_collisions_threaded(rigidbody_objects)
+        else:
+            self._check_collisions_direct(rigidbody_objects)
+
+    def _check_collisions_direct(self, rigidbody_objects):
+        """Direct collision checking for small object counts."""
+        for i, obj1 in enumerate(rigidbody_objects):
             for j, obj2 in enumerate(self.physics_objects):
                 if i >= j or obj2['type'] == 'None':
                     continue
@@ -2794,6 +3403,52 @@ class App(ctk.CTk):
 
                     # Collision detected - apply separation and response
                     self._resolve_collision(obj1, obj2)
+
+    def _check_collisions_threaded(self, rigidbody_objects):
+        """Threaded collision checking for many objects."""
+        # Split objects into chunks for parallel processing
+        chunk_size = max(2, len(rigidbody_objects) // 4)
+        chunks = [rigidbody_objects[i:i + chunk_size] for i in range(0, len(rigidbody_objects), chunk_size)]
+
+        # Submit collision detection tasks
+        futures = []
+        for chunk in chunks:
+            future = self.thread_pool.submit(self._detect_collisions_chunk, chunk, self.physics_objects)
+            futures.append(future)
+
+        # Collect collision results
+        all_collisions = []
+        for future in futures:
+            try:
+                collisions = future.result(timeout=0.008)  # 8ms timeout
+                all_collisions.extend(collisions)
+            except Exception as e:
+                print(f"Collision detection timeout: {e}")
+
+        # Resolve collisions on main thread
+        for obj1, obj2 in all_collisions:
+            self._resolve_collision(obj1, obj2)
+
+    def _detect_collisions_chunk(self, chunk_objects, all_objects):
+        """Detect collisions for a chunk of objects (thread-safe)."""
+        collisions = []
+        for obj1 in chunk_objects:
+            for obj2 in all_objects:
+                if obj1 is obj2 or obj2['type'] == 'None':
+                    continue
+
+                # Simple bounding box collision detection
+                bounds1 = obj1['bounds']
+                bounds2 = obj2['bounds']
+
+                # Check if bounding boxes overlap
+                if (bounds1['min'][0] <= bounds2['max'][0] and bounds1['max'][0] >= bounds2['min'][0] and
+                    bounds1['min'][1] <= bounds2['max'][1] and bounds1['max'][1] >= bounds2['min'][1] and
+                    bounds1['min'][2] <= bounds2['max'][2] and bounds1['max'][2] >= bounds2['min'][2]):
+
+                    collisions.append((obj1, obj2))
+
+        return collisions
 
     def _resolve_collision(self, obj1, obj2):
         """Resolve collision between two physics objects."""
@@ -3108,6 +3763,9 @@ class App(ctk.CTk):
             print("No objects in scene to save.")
             return
 
+        # Debug: Print current sun visibility state before saving
+        print(f"DEBUG: Saving sun_visible state: {self.sun_visible}")
+
         filepath = filedialog.asksaveasfilename(
             title="Save Scene As",
             defaultextension=".hamidmap",
@@ -3136,7 +3794,8 @@ class App(ctk.CTk):
                 "environment": {
                     "sun_color": [float(x) for x in self.sun_color],
                     "sky_color": [float(x) for x in self.sky_color],
-                    "halo_color": [float(x) for x in self.halo_color]
+                    "halo_color": [float(x) for x in self.halo_color],
+                    "sun_visible": bool(self.sun_visible)
                 },
                 "objects": []
             }
@@ -3231,6 +3890,26 @@ class App(ctk.CTk):
                 self.sun_color = env_data.get("sun_color", [1.0, 1.0, 0.95, 1.0])
                 self.sky_color = env_data.get("sky_color", [0.53, 0.81, 0.92, 1.0])
                 self.halo_color = env_data.get("halo_color", [1.0, 0.9, 0.7, 0.15])
+
+                # Restore sun visibility state
+                self.sun_visible = env_data.get("sun_visible", True)
+                print(f"Loading sun visibility state: {self.sun_visible}")
+
+                # Update checkbox if it exists
+                if hasattr(self, 'sun_visible_var') and self.sun_visible_var is not None:
+                    try:
+                        self.sun_visible_var.set(self.sun_visible)
+                        print(f"Updated checkbox to: {self.sun_visible}")
+                    except Exception as e:
+                        print(f"Error updating checkbox: {e}")
+
+                # Update button states
+                try:
+                    self.toggle_sun_visibility()
+                except Exception as e:
+                    print(f"Warning: Could not update sun button states: {e}")
+                    self.sun_visible = True
+
                 # Apply sky color immediately
                 glClearColor(self.sky_color[0], self.sky_color[1], self.sky_color[2], self.sky_color[3])
 
