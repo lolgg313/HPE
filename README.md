@@ -3,6 +3,8 @@
 
 [![PyPI Downloads](https://static.pepy.tech/badge/hpe)](https://pepy.tech/projects/hpe)
 
+![HPE](1.jpg) ![HPE](2.jpg)
+
 ## Installation
 
 ### Adding Scripts Path to PATH (Windows)
