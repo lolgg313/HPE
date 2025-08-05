@@ -1,67 +1,98 @@
-![Hamid Py Engine](hpe.jpg)
-# Hamid Py Engine ( HPE )
+# ![logo](hpe.jpg) Hamid Py Engine (HPE)
 
-[![PyPI Downloads](https://static.pepy.tech/badge/hpe)](https://pepy.tech/projects/hpe)
+[![PyPI Version](https://img.shields.io/pypi/v/hpe.svg)](https://pypi.org/project/hpe)  
+[![Python Versions](https://img.shields.io/pypi/pyversions/hpe.svg)](https://pypi.org/project/hpe)  
+[![PyPI Downloads](https://static.pepy.tech/badge/hpe)](https://pepy.tech/project/hpe)  
+[![PyPI Downloads Monthly](https://static.pepy.tech/badge/hpe/month)](https://pepy.tech/project/hpe)  
+[![License](https://img.shields.io/github/license/lolgg313/HPE)](./LICENSE)  
+[![Last Commit](https://img.shields.io/github/last-commit/lolgg313/HPE)](https://github.com/lolgg313/HPE)  
+[![Repo Size](https://img.shields.io/github/repo-size/lolgg313/HPE)](https://github.com/lolgg313/HPE)  
+[![Issues](https://img.shields.io/github/issues/lolgg313/HPE)](https://github.com/lolgg313/HPE/issues)  
+[![Forks](https://img.shields.io/github/forks/lolgg313/HPE?style=social)](https://github.com/lolgg313/HPE/network)  
+[![Stars](https://img.shields.io/github/stars/lolgg313/HPE?style=social)](https://github.com/lolgg313/HPE/stargazers)
 
-![HPE](1.jpg) ![HPE](2.jpg)
+> ✨ A lightweight Game engine!
 
-## Installation
+![HPE Screenshot 1](1.jpg)
+![HPE Screenshot 2](2.jpg)
 
-### Adding Scripts Path to PATH (Windows)
+---
 
-If you encounter a "command not found" error when running `hpe`, add the following path to your system's PATH:
+## 📦 Installation
 
-1. Find your Python Scripts path:
+```bash
+pip install hpe
+```
+
+---
+
+## ⚙️ Add Scripts Path to `PATH` (Windows)
+
+If the `hpe` command is not recognized:
+
+1. Locate your Scripts path:
    ```
    C:\Users\<YourName>\AppData\Roaming\Python\Python313\Scripts
    ```
-   (Replace `<YourName>` with your actual username)
+   Replace `<YourName>` with your actual Windows username.
 
 2. Add to PATH:
-   - Press Windows + R
-   - Type `sysdm.cpl` and press Enter
-   - Go to the Advanced tab
-   - Click Environment Variables
-   - Under User variables, select Path and click Edit
-   - Click New and paste the path above
-   - Click OK on all windows
+   - Press **Win + R**, run `sysdm.cpl`
+   - Go to **Advanced** tab > **Environment Variables**
+   - Under *User variables*, select **Path** > **Edit** > **New** > paste the path
+   - Click OK on all windows and restart your terminal
 
-3. Close and reopen your terminal
+---
 
-## Usage
+## 🚀 Usage
 
-### Available Commands
+| Command         | Description                          |
+|----------------|--------------------------------------|
+| `hpe` / `hpe help` | Show help message                 |
+| `hpe run`       | Run the main HPE code                |
+| `hpe get`       | Copy `hpe.py` to current directory   |
 
-| Command | Description |
-|---------|-------------|
-| `hpe` or `hpe help` | Show help message |
-| `hpe run` | Execute hpe code |
-| `hpe get` | Copy hpe.py to current directory |
+---
 
-### Examples
+### 🧪 Examples
 
-1. Show help:
 ```bash
 hpe
 ```
 
-2. Run hpe code:
 ```bash
 hpe run
 ```
 
-Output:
+**Output:**
 ```
 Hello from hpe!
 This is the main hpe code.
 ```
 
-3. Copy hpe.py file:
 ```bash
 hpe get
 ```
 
-Output:
+**Output:**
 ```
 hpe.py copied to: /current/directory/hpe.py
 ```
+
+---
+
+## 📁 Project Structure (Simplified)
+
+```
+hpe/
+├── __main__.py
+├── cli.py
+├── hpe.py
+└── ...
+```
+
+---
+
+## 📄 License
+
+Released under the MIT License © Hamid Reza Jahanshahi
