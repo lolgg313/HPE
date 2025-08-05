@@ -78,21 +78,3 @@ hpe get
 ```
 hpe.py copied to: /current/directory/hpe.py
 ```
-
----
-
-## 📁 Project Structure (Simplified)
-
-```
-hpe/
-├── __main__.py
-├── cli.py
-├── hpe.py
-└── ...
-```
-
----
-
-## 📄 License
-
-Released under the MIT License © Hamid Reza Jahanshahi
