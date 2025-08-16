@@ -13,6 +13,9 @@
 
 > ✨ A lightweight Game engine!
 
+> [!Note]
+> `Fixed` TERRAIN EDITOR
+
 ![HPE Screenshot 1](1.jpg)
 ![HPE Screenshot 2](2.jpg)
 
