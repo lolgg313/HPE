@@ -41,6 +41,110 @@ pygame.init()
 if pygame.display.get_init():
     pygame.display.quit()
 
+# --- Terrain Editing Helper Functions ---
+def screen_to_world_ray_glu(mouse_x, mouse_y, screen_width, screen_height, view_matrix, projection_matrix):
+    """Convert screen coordinates to world ray for terrain interaction."""
+    if screen_height == 0 or screen_width == 0:
+        return np.array([0,0,0], dtype=np.float32), np.array([0,0,-1], dtype=np.float32)
+
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    ogl_mouse_y = float(viewport[3] - mouse_y)
+
+    view_matrix_double = np.array(view_matrix, dtype=np.float64)
+    projection_matrix_double = np.array(projection_matrix, dtype=np.float64)
+
+    try:
+        near_tuple = gluUnProject(float(mouse_x), ogl_mouse_y, 0.0,
+                                  model=view_matrix_double, proj=projection_matrix_double, view=viewport)
+        far_tuple = gluUnProject(float(mouse_x), ogl_mouse_y, 1.0,
+                                 model=view_matrix_double, proj=projection_matrix_double, view=viewport)
+    except Exception as e:
+        return np.array([0,0,0], dtype=np.float32), np.array([0,0,-1], dtype=np.float32)
+
+    if near_tuple is None or far_tuple is None:
+        return np.array([0,0,0], dtype=np.float32), np.array([0,0,-1], dtype=np.float32)
+
+    origin = np.array(near_tuple, dtype=np.float32)
+    far_point = np.array(far_tuple, dtype=np.float32)
+    direction = far_point - origin
+    norm = np.linalg.norm(direction)
+    return origin, direction / norm if norm > 1e-8 else np.array([0,0,-1], dtype=np.float32)
+
+def ray_terrain_intersection(ray_origin, ray_direction, terrain_obj, max_dist=4000.0):
+    """Find intersection point between ray and terrain mesh."""
+    if not terrain_obj or 'vertices' not in terrain_obj:
+        return None
+
+    vertices = terrain_obj['vertices']
+    if len(vertices) == 0:
+        return None
+
+    # Get terrain bounds
+    min_x, max_x = np.min(vertices[:, 0]), np.max(vertices[:, 0])
+    min_z, max_z = np.min(vertices[:, 2]), np.max(vertices[:, 2])
+
+    # Simple ray-mesh intersection using terrain bounds
+    num_steps = 200
+    step_size = max_dist / num_steps
+
+    for i in range(1, num_steps + 1):
+        current_t = i * step_size
+        current_pos_on_ray = ray_origin + ray_direction * current_t
+
+        # Check if ray point is within terrain bounds
+        if (min_x <= current_pos_on_ray[0] <= max_x and
+            min_z <= current_pos_on_ray[2] <= max_z):
+
+            # Get terrain height at this position
+            terrain_height = get_terrain_height_at_position(terrain_obj, current_pos_on_ray[0], current_pos_on_ray[2])
+            if terrain_height is not None and current_pos_on_ray[1] <= terrain_height + 0.1:
+                return np.array([current_pos_on_ray[0], terrain_height, current_pos_on_ray[2]], dtype=np.float32)
+
+    return None
+
+def get_terrain_height_at_position(terrain_obj, world_x, world_z):
+    """Get terrain height at a specific world position."""
+    if not terrain_obj or 'vertices' not in terrain_obj:
+        return None
+
+    vertices = terrain_obj['vertices']
+    if len(vertices) == 0:
+        return None
+
+    # For grid-based terrain, use heightmap if available
+    terrain_props = terrain_obj.get('terrain_properties')
+    if terrain_props:
+        heightmap = terrain_props['heightmap']
+        resolution = terrain_props['resolution']
+        size_x = terrain_props['size_x']
+        size_y = terrain_props['size_y']
+
+        # Convert world coordinates to heightmap coordinates
+        half_x = size_x / 2.0
+        half_y = size_y / 2.0
+
+        if not (-half_x <= world_x <= half_x and -half_y <= world_z <= half_y):
+            return None
+
+        vertex_spacing = size_x / (resolution - 1) if resolution > 1 else size_x
+        c = int(round((world_x + half_x) / vertex_spacing))
+        r = int(round((world_z + half_y) / vertex_spacing))
+
+        if 0 <= r < resolution and 0 <= c < resolution:
+            return heightmap[r, c]
+
+    # Fallback: find closest vertex and return its height
+    min_dist = float('inf')
+    closest_height = None
+
+    for vertex in vertices:
+        dist = math.sqrt((vertex[0] - world_x)**2 + (vertex[2] - world_z)**2)
+        if dist < min_dist:
+            min_dist = dist
+            closest_height = vertex[1]
+
+    return closest_height
+
 # --- Helper GLSL Shader Compilation Functions ---
 def compile_shader(source, shader_type):
     shader = glCreateShader(shader_type)
@@ -274,6 +378,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         self.last_y = 0
         self.first_mouse_move = True
         self.rmb_down = False
+        self.lmb_down = False  # For terrain editing
 
         # FPS Controller variables
         self.fps_mouse_sensitivity = None
@@ -318,6 +423,14 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         # --- Threading Infrastructure ---
         self.thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="GLFrame")
+
+        # --- Terrain Editing State ---
+        self.terrain_editing_mode = False  # When True, terrain editing is active
+        self.terrain_brush_size = 25.0     # Brush radius for terrain editing
+        self.terrain_brush_strength = 0.5  # Brush strength for terrain editing
+        self.current_terrain_obj = None    # Reference to currently selected terrain object
+        self.last_mouse_x = 0              # For terrain editing raycasting
+        self.last_mouse_y = 0
         self.texture_queue = queue.Queue()
         self.mesh_processing_queue = queue.Queue()
         self.physics_queue = queue.Queue()
@@ -514,7 +627,19 @@ class CubeOpenGLFrame(OpenGLFrame):
         if self.fps_mouse_sensitivity is not None:
             return
 
+        # Track left mouse button state for terrain editing
+        self.lmb_down = True
+
+        # Store mouse position for terrain editing
+        self.last_mouse_x = event.x
+        self.last_mouse_y = event.y
+
         ray_origin, ray_direction = self._screen_to_world_ray(event.x, event.y)
+
+        # Handle terrain editing mode
+        if self.terrain_editing_mode and self.current_terrain_obj:
+            self._handle_terrain_editing(ray_origin, ray_direction, event)
+            return
 
         if self.selected_part_index is not None:
             hit_handle, _ = self._get_handle_under_mouse(ray_origin, ray_direction)
@@ -526,6 +651,9 @@ class CubeOpenGLFrame(OpenGLFrame):
         self._update_selection(ray_origin, ray_direction)
 
     def on_lmb_release(self, event):
+        # Track left mouse button state for terrain editing
+        self.lmb_down = False
+
         if self.active_gizmo_handle:
             self._handle_drag_end()
 
@@ -549,6 +677,13 @@ class CubeOpenGLFrame(OpenGLFrame):
         # FPS mode - always capture mouse for looking
         if self.fps_mouse_sensitivity is not None:
             self._handle_fps_mouse_look(event.x, event.y)
+            return
+
+        # Handle terrain editing when dragging
+        if (self.terrain_editing_mode and self.current_terrain_obj and
+            hasattr(self, 'lmb_down') and self.lmb_down):
+            ray_origin, ray_direction = self._screen_to_world_ray(event.x, event.y)
+            self._handle_terrain_editing(ray_origin, ray_direction, event)
             return
 
         if self.active_gizmo_handle:
@@ -908,6 +1043,133 @@ class CubeOpenGLFrame(OpenGLFrame):
                     highest_ground = max(highest_ground, object_top)
 
         return highest_ground
+
+    # -------------------------------------------------------------------
+    # Terrain Editing Methods
+    # -------------------------------------------------------------------
+
+    def _handle_terrain_editing(self, ray_origin, ray_direction, event):
+        """Handle terrain sculpting when in terrain editing mode."""
+        if not self.current_terrain_obj:
+            return
+
+        # Find intersection with terrain
+        intersection_point = ray_terrain_intersection(ray_origin, ray_direction, self.current_terrain_obj)
+        if intersection_point is None:
+            return
+
+        # Determine if we're raising or lowering based on modifier keys
+        is_raising = True  # Default to raising
+        if hasattr(event, 'state'):
+            # Check for Shift key (lower terrain)
+            if event.state & 0x1:  # Shift key
+                is_raising = False
+
+        # Apply terrain modification
+        self._modify_terrain_at_point(intersection_point, is_raising)
+
+    def _modify_terrain_at_point(self, world_point, is_raising=True):
+        """Modify terrain height at a specific world point using proper sculpting."""
+        if not self.current_terrain_obj or not self.current_terrain_obj.get('is_terrain', False):
+            return
+
+        # Get terrain properties
+        terrain_props = self.current_terrain_obj.get('terrain_properties')
+        if not terrain_props:
+            return
+
+        vertices = self.current_terrain_obj['vertices']
+        heightmap = terrain_props['heightmap']
+        resolution = terrain_props['resolution']
+        size_x = terrain_props['size_x']
+        size_y = terrain_props['size_y']
+
+        # Apply sculpting using the same algorithm as GroundController.py
+        direction = 1 if is_raising else -1
+        changed = self._sculpt_terrain_vertices(
+            world_point[0], world_point[2],
+            self.terrain_brush_size,
+            self.terrain_brush_strength,
+            direction,
+            vertices, heightmap, resolution, size_x, size_y
+        )
+
+        if changed:
+            # Update the terrain object
+            self.current_terrain_obj['vertices'] = vertices
+            terrain_props['heightmap'] = heightmap
+
+            # Recalculate normals
+            self._recalculate_terrain_normals()
+
+    def _sculpt_terrain_vertices(self, world_x, world_z, radius, strength, direction,
+                                vertices, heightmap, resolution, size_x, size_y):
+        """Sculpt terrain vertices using the same algorithm as GroundController.py"""
+        if vertices.size == 0:
+            return False
+
+        radius_sq = radius * radius
+        changed_geometry = False
+        vertex_spacing = size_x / (resolution - 1) if resolution > 1 else size_x
+        half_size_x = size_x / 2.0
+        half_size_y = size_y / 2.0
+
+        # Store height updates to avoid feedback loop
+        new_heights_updates = {}
+
+        for i in range(vertices.shape[0]):
+            vx, vz = vertices[i, 0], vertices[i, 2]
+            dist_sq = (vx - world_x)**2 + (vz - world_z)**2
+
+            if dist_sq < radius_sq:
+                falloff = max(0, 1.0 - math.sqrt(dist_sq) / radius if radius > 1e-5 else 1.0)
+                current_y = vertices[i, 1]
+                new_y = current_y + direction * strength * falloff
+                new_heights_updates[i] = new_y
+                changed_geometry = True
+
+        if changed_geometry:
+            # Apply height updates
+            for i, new_y in new_heights_updates.items():
+                vertices[i, 1] = new_y
+
+                # Update heightmap
+                vx, vz = vertices[i, 0], vertices[i, 2]
+                c = int(round((vx + half_size_x) / vertex_spacing))
+                r = int(round((vz + half_size_y) / vertex_spacing))
+                if 0 <= r < resolution and 0 <= c < resolution:
+                    heightmap[r, c] = new_y
+
+        return changed_geometry
+
+    def _recalculate_terrain_normals(self):
+        """Recalculate terrain normals after sculpting."""
+        if not self.current_terrain_obj:
+            return
+
+        vertices = self.current_terrain_obj['vertices']
+        faces = self.current_terrain_obj['faces']
+
+        # Simple normal calculation - all pointing up for now
+        # For better results, calculate per-face normals and average
+        normals = np.tile([0, 1, 0], (len(vertices), 1)).astype(np.float32)
+        self.current_terrain_obj['normals'] = normals
+
+    def set_terrain_editing_mode(self, enabled, terrain_obj=None):
+        """Enable or disable terrain editing mode."""
+        self.terrain_editing_mode = enabled
+        if enabled and terrain_obj:
+            self.current_terrain_obj = terrain_obj
+        elif not enabled:
+            self.current_terrain_obj = None
+
+    def set_terrain_brush_size(self, size):
+        """Set the terrain brush size."""
+        self.terrain_brush_size = max(1.0, min(100.0, size))
+
+    def set_terrain_brush_strength(self, strength):
+        """Set the terrain brush strength."""
+        self.terrain_brush_strength = max(0.1, min(2.0, strength))
 
     # -------------------------------------------------------------------
     # Model Loading and Processing
@@ -2366,7 +2628,7 @@ class App(ctk.CTk):
         help_text = ctk.CTkTextbox(help_menu)
         help_text.pack(pady=10, padx=10, fill="both", expand=True)
         help_text.insert("0.0",
-            "FreeFly Game Engine v10\n\n"
+            "Hamid PY Engine V1.4\n\n"
             "Controls:\n"
             "- Right-click + drag: Rotate camera\n"
             "- WASD: Move camera\n"
@@ -2682,22 +2944,29 @@ class App(ctk.CTk):
             traceback.print_exc()
 
     def open_terrain_editor(self):
-        """Opens terrain editor window for creating plane mesh terrain."""
+        """Opens terrain editor window with creation and sculpting tools."""
         terrain_window = ctk.CTkToplevel(self)
         terrain_window.title("Terrain Editor")
-        terrain_window.geometry("300x280")
+        terrain_window.geometry("350x535")
         terrain_window.resizable(False, False)
 
         # Position window
         terrain_window.geometry("+400+200")
 
         # Title label
-        title_label = ctk.CTkLabel(terrain_window, text="Create Plane Terrain", font=ctk.CTkFont(size=16, weight="bold"))
+        title_label = ctk.CTkLabel(terrain_window, text="Terrain Editor", font=ctk.CTkFont(size=16, weight="bold"))
         title_label.pack(pady=10)
 
+        # --- TERRAIN CREATION SECTION ---
+        creation_frame = ctk.CTkFrame(terrain_window)
+        creation_frame.pack(pady=10, padx=20, fill="x")
+
+        creation_title = ctk.CTkLabel(creation_frame, text="Create New Terrain", font=ctk.CTkFont(size=14, weight="bold"))
+        creation_title.pack(pady=5)
+
         # Size controls frame
-        size_frame = ctk.CTkFrame(terrain_window)
-        size_frame.pack(pady=10, padx=20, fill="x")
+        size_frame = ctk.CTkFrame(creation_frame)
+        size_frame.pack(pady=5, padx=10, fill="x")
 
         # X size control
         x_label = ctk.CTkLabel(size_frame, text="X Size (km):")
@@ -2725,9 +2994,136 @@ class App(ctk.CTk):
         self.terrain_color_button.grid(row=2, column=1, padx=10, pady=5)
 
         # Create button
-        create_button = ctk.CTkButton(terrain_window, text="Create Terrain",
+        create_button = ctk.CTkButton(creation_frame, text="Create Terrain",
                                     command=lambda: self.create_terrain_plane(terrain_window))
-        create_button.pack(pady=20)
+        create_button.pack(pady=10)
+
+        # --- TERRAIN SCULPTING SECTION ---
+        sculpting_frame = ctk.CTkFrame(terrain_window)
+        sculpting_frame.pack(pady=10, padx=20, fill="x")
+
+        sculpting_title = ctk.CTkLabel(sculpting_frame, text="Terrain Sculpting Tools", font=ctk.CTkFont(size=14, weight="bold"))
+        sculpting_title.pack(pady=5)
+
+        # Terrain editing mode toggle
+        self.terrain_editing_var = ctk.BooleanVar()
+        editing_checkbox = ctk.CTkCheckBox(sculpting_frame, text="Enable Terrain Editing Mode",
+                                         variable=self.terrain_editing_var,
+                                         command=self.toggle_terrain_editing)
+        editing_checkbox.pack(pady=5)
+
+        # Brush controls frame
+        brush_frame = ctk.CTkFrame(sculpting_frame)
+        brush_frame.pack(pady=5, padx=10, fill="x")
+
+        # Brush size control
+        brush_size_label = ctk.CTkLabel(brush_frame, text="Brush Size:")
+        brush_size_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+
+        self.brush_size_var = ctk.DoubleVar(value=25.0)
+        brush_size_slider = ctk.CTkSlider(brush_frame, from_=5.0, to=100.0,
+                                        variable=self.brush_size_var,
+                                        command=self.update_brush_size)
+        brush_size_slider.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
+
+        brush_size_value = ctk.CTkLabel(brush_frame, text="25.0")
+        brush_size_value.grid(row=0, column=2, padx=5, pady=5)
+        self.brush_size_value_label = brush_size_value
+
+        # Brush strength control
+        brush_strength_label = ctk.CTkLabel(brush_frame, text="Brush Strength:")
+        brush_strength_label.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+
+        self.brush_strength_var = ctk.DoubleVar(value=0.5)
+        brush_strength_slider = ctk.CTkSlider(brush_frame, from_=0.1, to=2.0,
+                                            variable=self.brush_strength_var,
+                                            command=self.update_brush_strength)
+        brush_strength_slider.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+
+        brush_strength_value = ctk.CTkLabel(brush_frame, text="0.5")
+        brush_strength_value.grid(row=1, column=2, padx=5, pady=5)
+        self.brush_strength_value_label = brush_strength_value
+
+        # Configure grid weights
+        brush_frame.grid_columnconfigure(1, weight=1)
+
+        # Instructions
+        instructions_frame = ctk.CTkFrame(sculpting_frame)
+        instructions_frame.pack(pady=5, padx=10, fill="x")
+
+        instructions_text = """Instructions:
+1. Select a terrain object first
+2. Enable terrain editing mode
+3. Left-click to raise terrain
+4. Shift + Left-click to lower terrain
+5. Adjust brush size and strength as needed"""
+
+        instructions_label = ctk.CTkLabel(instructions_frame, text=instructions_text,
+                                        justify="left", font=ctk.CTkFont(size=11))
+        instructions_label.pack(pady=10, padx=10)
+
+    def toggle_terrain_editing(self):
+        """Toggle terrain editing mode on/off."""
+        enabled = self.terrain_editing_var.get()
+
+        if enabled:
+            # Check if a terrain object is selected
+            if (hasattr(self.gl_frame, 'selected_part_index') and
+                self.gl_frame.selected_part_index is not None):
+
+                selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+
+                # Check if selected object is a terrain (plane mesh)
+                if self._is_terrain_object(selected_obj):
+                    self.gl_frame.set_terrain_editing_mode(True, selected_obj)
+                    print("Terrain editing mode enabled")
+                else:
+                    print("Please select a terrain object first")
+                    self.terrain_editing_var.set(False)
+            else:
+                print("Please select a terrain object first")
+                self.terrain_editing_var.set(False)
+        else:
+            self.gl_frame.set_terrain_editing_mode(False)
+            print("Terrain editing mode disabled")
+
+    def update_brush_size(self, value):
+        """Update terrain brush size."""
+        size = float(value)
+        self.gl_frame.set_terrain_brush_size(size)
+        self.brush_size_value_label.configure(text=f"{size:.1f}")
+
+    def update_brush_strength(self, value):
+        """Update terrain brush strength."""
+        strength = float(value)
+        self.gl_frame.set_terrain_brush_strength(strength)
+        self.brush_strength_value_label.configure(text=f"{strength:.1f}")
+
+    def _is_terrain_object(self, obj):
+        """Check if an object is a terrain."""
+        # Check for explicit terrain marking
+        if obj.get('is_terrain', False):
+            return True
+
+        # Fallback: check if object has terrain-like properties
+        if 'vertices' not in obj:
+            return False
+
+        vertices = obj['vertices']
+        if len(vertices) == 0:
+            return False
+
+        # Check if mesh is relatively flat (terrain characteristic)
+        y_range = np.max(vertices[:, 1]) - np.min(vertices[:, 1])
+        x_range = np.max(vertices[:, 0]) - np.min(vertices[:, 0])
+        z_range = np.max(vertices[:, 2]) - np.min(vertices[:, 2])
+
+        # If Y range is much smaller than X or Z range, it's likely terrain
+        horizontal_range = max(x_range, z_range)
+        if horizontal_range > 0 and y_range / horizontal_range < 0.1:
+            return True
+
+        return False
 
     def choose_terrain_color(self):
         """Opens color picker for terrain color."""
@@ -3506,44 +3902,137 @@ class App(ctk.CTk):
 
         return size1 + size2
 
+    def _generate_terrain_grid(self, x_size, y_size, resolution):
+        """Generate a detailed grid mesh for terrain sculpting."""
+        vertices_list = []
+        texcoords_list = []
+        faces_list = []
+
+        # Create heightmap for terrain sculpting
+        heightmap = np.zeros((resolution, resolution), dtype=np.float32)
+
+        # Generate vertices in a grid pattern
+        half_x = x_size / 2.0
+        half_y = y_size / 2.0
+        vertex_spacing_x = x_size / (resolution - 1) if resolution > 1 else x_size
+        vertex_spacing_y = y_size / (resolution - 1) if resolution > 1 else y_size
+
+        for row in range(resolution):
+            for col in range(resolution):
+                # Calculate world position
+                x = col * vertex_spacing_x - half_x
+                z = row * vertex_spacing_y - half_y
+                y = heightmap[row, col]  # Start with flat terrain
+
+                vertices_list.append([x, y, z])
+
+                # Calculate UV coordinates
+                u = col / (resolution - 1) if resolution > 1 else 0
+                v = row / (resolution - 1) if resolution > 1 else 0
+                texcoords_list.append([u, v])
+
+                # Create faces (two triangles per quad)
+                if row < resolution - 1 and col < resolution - 1:
+                    # Current quad vertices
+                    tl = row * resolution + col        # Top-left
+                    tr = row * resolution + col + 1    # Top-right
+                    bl = (row + 1) * resolution + col  # Bottom-left
+                    br = (row + 1) * resolution + col + 1  # Bottom-right
+
+                    # Two triangles per quad (counter-clockwise)
+                    faces_list.extend([
+                        [tl, bl, tr],  # First triangle
+                        [tr, bl, br]   # Second triangle
+                    ])
+
+        vertices = np.array(vertices_list, dtype=np.float32)
+        faces = np.array(faces_list, dtype=np.uint32)
+        texcoords = np.array(texcoords_list, dtype=np.float32)
+
+        # Calculate normals (all pointing up initially)
+        normals = np.tile([0, 1, 0], (len(vertices), 1)).astype(np.float32)
+
+        return vertices, faces, normals, texcoords, heightmap
+
+    def _recreate_terrain_with_heightmap(self, x_size, y_size, resolution, saved_heightmap):
+        """Recreate terrain grid with saved heightmap data."""
+        vertices_list = []
+        texcoords_list = []
+        faces_list = []
+
+        # Convert saved heightmap back to numpy array
+        heightmap = np.array(saved_heightmap, dtype=np.float32)
+
+        # Ensure heightmap has correct dimensions
+        if heightmap.shape != (resolution, resolution):
+            print(f"Warning: Heightmap shape {heightmap.shape} doesn't match resolution {resolution}")
+            # Create new heightmap if dimensions don't match
+            heightmap = np.zeros((resolution, resolution), dtype=np.float32)
+
+        # Generate vertices using the saved heightmap
+        half_x = x_size / 2.0
+        half_y = y_size / 2.0
+        vertex_spacing_x = x_size / (resolution - 1) if resolution > 1 else x_size
+        vertex_spacing_y = y_size / (resolution - 1) if resolution > 1 else y_size
+
+        for row in range(resolution):
+            for col in range(resolution):
+                # Calculate world position
+                x = col * vertex_spacing_x - half_x
+                z = row * vertex_spacing_y - half_y
+                y = heightmap[row, col]  # Use saved height data
+
+                vertices_list.append([x, y, z])
+
+                # Calculate UV coordinates
+                u = col / (resolution - 1) if resolution > 1 else 0
+                v = row / (resolution - 1) if resolution > 1 else 0
+                texcoords_list.append([u, v])
+
+                # Create faces (two triangles per quad)
+                if row < resolution - 1 and col < resolution - 1:
+                    # Current quad vertices
+                    tl = row * resolution + col        # Top-left
+                    tr = row * resolution + col + 1    # Top-right
+                    bl = (row + 1) * resolution + col  # Bottom-left
+                    br = (row + 1) * resolution + col + 1  # Bottom-right
+
+                    # Two triangles per quad (counter-clockwise)
+                    faces_list.extend([
+                        [tl, bl, tr],  # First triangle
+                        [tr, bl, br]   # Second triangle
+                    ])
+
+        vertices = np.array(vertices_list, dtype=np.float32)
+        faces = np.array(faces_list, dtype=np.uint32)
+        texcoords = np.array(texcoords_list, dtype=np.float32)
+
+        # Calculate normals (all pointing up initially - could be improved)
+        normals = np.tile([0, 1, 0], (len(vertices), 1)).astype(np.float32)
+
+        return vertices, faces, normals, texcoords, heightmap
+
     def create_terrain_plane(self, window):
-        """Creates a plane mesh terrain with specified dimensions."""
+        """Creates a detailed grid mesh terrain with specified dimensions for sculpting."""
         try:
             # Get dimensions in km and convert to meters (multiply by 1000)
             x_size = float(self.terrain_x_var.get()) * 1000.0
             y_size = float(self.terrain_y_var.get()) * 1000.0
 
-            # Create plane mesh vertices (flat on XZ plane)
-            vertices = np.array([
-                [-x_size/2, 0, -y_size/2],  # Bottom-left
-                [x_size/2, 0, -y_size/2],   # Bottom-right
-                [x_size/2, 0, y_size/2],    # Top-right
-                [-x_size/2, 0, y_size/2]    # Top-left
-            ], dtype=np.float32)
+            # Create detailed grid mesh for terrain sculpting (6x higher quality)
+            resolution = 157  # Grid resolution for sculpting (157x157 = 24,649 vertices, ~49,152 triangles)
+            vertices, faces, normals, texcoords, heightmap = self._generate_terrain_grid(x_size, y_size, resolution)
 
-            # Create faces (two triangles) - counter-clockwise winding for upward facing
-            faces = np.array([
-                [0, 2, 1],  # First triangle (counter-clockwise)
-                [0, 3, 2]   # Second triangle (counter-clockwise)
-            ], dtype=np.uint32)
+            # Store terrain-specific data for sculpting
+            terrain_properties = {
+                'size_x': x_size,
+                'size_y': y_size,
+                'resolution': resolution,
+                'heightmap': heightmap,
+                'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
+            }
 
-            # Create normals (pointing up)
-            normals = np.array([
-                [0, 1, 0],  # Up
-                [0, 1, 0],  # Up
-                [0, 1, 0],  # Up
-                [0, 1, 0]   # Up
-            ], dtype=np.float32)
-
-            # Create UV coordinates
-            texcoords = np.array([
-                [0, 0],  # Bottom-left
-                [1, 0],  # Bottom-right
-                [1, 1],  # Top-right
-                [0, 1]   # Top-left
-            ], dtype=np.float32)
-
-            # Create terrain object data
+            # Create terrain object data with sculpting support
             terrain_data = {
                 'name': f"Terrain_{x_size/1000:.1f}x{y_size/1000:.1f}km",
                 'vertices': vertices,
@@ -3557,7 +4046,9 @@ class App(ctk.CTk):
                 'is_transparent': False,
                 'vertex_colors': None,
                 'pil_image_ref': None,
-                'model_file': None
+                'model_file': None,
+                'terrain_properties': terrain_properties,  # Add terrain-specific data
+                'is_terrain': True  # Mark as terrain for identification
             }
 
             # Add to scene
@@ -3823,21 +4314,33 @@ class App(ctk.CTk):
                 }
 
                 # Add terrain-specific data if this is a terrain object
-                if obj.get('name', '').startswith('Terrain_'):
-                    # Extract terrain size from name (format: "Terrain_1.0x1.5km")
-                    name_parts = obj.get('name', '').replace('Terrain_', '').replace('km', '').split('x')
-                    if len(name_parts) == 2:
-                        try:
-                            terrain_x = float(name_parts[0])
-                            terrain_y = float(name_parts[1])
-                            obj_data["terrain_data"] = {
-                                "is_terrain": True,
-                                "size_x_km": terrain_x,
-                                "size_y_km": terrain_y,
-                                "terrain_color": obj['base_color_factor']
-                            }
-                        except ValueError:
-                            pass
+                if obj.get('is_terrain', False) or obj.get('name', '').startswith('Terrain_'):
+                    terrain_props = obj.get('terrain_properties')
+                    if terrain_props:
+                        # Save detailed terrain data including heightmap
+                        obj_data["terrain_data"] = {
+                            "is_terrain": True,
+                            "size_x_km": terrain_props['size_x'] / 1000.0,  # Convert meters to km
+                            "size_y_km": terrain_props['size_y'] / 1000.0,  # Convert meters to km
+                            "resolution": terrain_props['resolution'],
+                            "heightmap": terrain_props['heightmap'].tolist(),  # Save heightmap as list
+                            "terrain_color": obj['base_color_factor']
+                        }
+                    else:
+                        # Fallback for old terrain format
+                        name_parts = obj.get('name', '').replace('Terrain_', '').replace('km', '').split('x')
+                        if len(name_parts) == 2:
+                            try:
+                                terrain_x = float(name_parts[0])
+                                terrain_y = float(name_parts[1])
+                                obj_data["terrain_data"] = {
+                                    "is_terrain": True,
+                                    "size_x_km": terrain_x,
+                                    "size_y_km": terrain_y,
+                                    "terrain_color": obj['base_color_factor']
+                                }
+                            except ValueError:
+                                pass
 
                 # Add primitive-specific data if this is a primitive object
                 if obj.get('is_primitive'):
@@ -3990,36 +4493,46 @@ class App(ctk.CTk):
             traceback.print_exc()
 
     def _recreate_terrain_from_data(self, obj_data, terrain_data):
-        """Recreate terrain from saved terrain data."""
+        """Recreate terrain from saved terrain data with heightmap support."""
         try:
             # Get terrain properties
             x_size_km = terrain_data.get('size_x_km', 1.0)
             y_size_km = terrain_data.get('size_y_km', 1.0)
             terrain_color = terrain_data.get('terrain_color', [0.4, 0.6, 0.3, 1.0])
+            resolution = terrain_data.get('resolution', 157)  # Default to 157x157 grid (6x higher quality)
+            saved_heightmap = terrain_data.get('heightmap')
 
             # Convert km to meters
             x_size = x_size_km * 1000.0
             y_size = y_size_km * 1000.0
 
-            # Create plane mesh vertices (same as terrain creation)
-            vertices = np.array([
-                [-x_size/2, 0, -y_size/2],  # Bottom-left
-                [x_size/2, 0, -y_size/2],   # Bottom-right
-                [x_size/2, 0, y_size/2],    # Top-right
-                [-x_size/2, 0, y_size/2]    # Top-left
-            ], dtype=np.float32)
+            if saved_heightmap and resolution:
+                # Recreate terrain with saved heightmap
+                vertices, faces, normals, texcoords, heightmap = self._recreate_terrain_with_heightmap(
+                    x_size, y_size, resolution, saved_heightmap
+                )
 
-            # Create faces (counter-clockwise winding)
-            faces = np.array([
-                [0, 2, 1],  # First triangle
-                [0, 3, 2]   # Second triangle
-            ], dtype=np.uint32)
+                # Store terrain-specific data for sculpting
+                terrain_properties = {
+                    'size_x': x_size,
+                    'size_y': y_size,
+                    'resolution': resolution,
+                    'heightmap': heightmap,
+                    'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
+                }
+            else:
+                # Fallback: create new grid terrain (for old save files)
+                vertices, faces, normals, texcoords, heightmap = self._generate_terrain_grid(x_size, y_size, resolution)
 
-            # Create normals and UVs
-            normals = np.array([[0, 1, 0], [0, 1, 0], [0, 1, 0], [0, 1, 0]], dtype=np.float32)
-            texcoords = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+                terrain_properties = {
+                    'size_x': x_size,
+                    'size_y': y_size,
+                    'resolution': resolution,
+                    'heightmap': heightmap,
+                    'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
+                }
 
-            # Create terrain object
+            # Create terrain object with sculpting support
             recreated_terrain = {
                 'name': obj_data.get('name', f"Terrain_{x_size_km:.1f}x{y_size_km:.1f}km"),
                 'vertices': vertices,
@@ -4033,7 +4546,9 @@ class App(ctk.CTk):
                 'is_transparent': obj_data['material'].get('is_transparent', False),
                 'vertex_colors': None,
                 'pil_image_ref': None,
-                'model_file': None
+                'model_file': None,
+                'terrain_properties': terrain_properties,  # Add terrain-specific data
+                'is_terrain': True  # Mark as terrain for identification
             }
 
             # Restore physics properties
@@ -4044,7 +4559,11 @@ class App(ctk.CTk):
 
             # Add to scene
             self.gl_frame.model_draw_list.append(recreated_terrain)
-            print(f"Successfully recreated terrain: {x_size_km:.1f}km x {y_size_km:.1f}km")
+
+            if saved_heightmap:
+                print(f"Successfully recreated terrain with heightmap: {x_size_km:.1f}km x {y_size_km:.1f}km")
+            else:
+                print(f"Successfully recreated terrain (new grid): {x_size_km:.1f}km x {y_size_km:.1f}km")
 
         except Exception as e:
             print(f"Error recreating terrain: {e}")
