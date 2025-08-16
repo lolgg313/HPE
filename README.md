@@ -14,7 +14,18 @@
 > ✨ A lightweight Game engine!
 
 > [!Note]
-> `Fixed` TERRAIN EDITOR
+> `Fixed` TERRAIN EDITOR ( TERRAIN EDITOR had been added with more set of tools. )
+
+# Minimum System
+> Cpu core i5 8th gen
+> 
+> Ram: 8 gb
+> 
+> Graphic Card: 8 gb vram
+> 
+> Memory Needed: 512 MB ~ 700 MB
+
+---
 
 ![HPE Screenshot 1](1.jpg)
 ![HPE Screenshot 2](2.jpg)
