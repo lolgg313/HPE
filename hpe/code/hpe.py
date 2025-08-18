@@ -102,6 +102,111 @@ def ray_terrain_intersection(ray_origin, ray_direction, terrain_obj, max_dist=40
 
     return None
 
+# --- Brush Shaders ---
+BRUSH_VERTEX_SHADER = """
+#version 330 core
+layout (location = 0) in vec3 aPos;
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+void main()
+{
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
+}
+"""
+
+BRUSH_FRAGMENT_SHADER = """
+#version 330 core
+out vec4 FragColor;
+uniform vec4 brushColor;
+void main()
+{
+    FragColor = brushColor;
+}
+"""
+
+# --- Brush Visualizer Class ---
+class BrushVisualizer:
+    def __init__(self, segments=32):
+        self.segments = segments
+        self.vertices = np.array([], dtype=np.float32)
+        self.VAO, self.VBO = None, None
+        self.shader_program = None
+        self.model_matrix = np.identity(4, dtype=np.float32).T
+        self.color = np.array([1.0, 1.0, 0.0, 0.7], dtype=np.float32)  # Yellow with transparency
+        self.visible = True
+        self.position = np.array([0, 0, 0], dtype=np.float32)
+        self._generate_geometry()
+
+    def _generate_geometry(self):
+        vertices_list = []
+        unit_radius = 1.0
+        for i in range(self.segments):
+            angle = i * (2 * math.pi / self.segments)
+            x1, z1 = math.cos(angle) * unit_radius, math.sin(angle) * unit_radius
+            angle_next = (i + 1) * (2 * math.pi / self.segments)
+            x2, z2 = math.cos(angle_next) * unit_radius, math.sin(angle_next) * unit_radius
+            vertices_list.extend([x1, 0.0, z1, x2, 0.0, z2])
+        self.vertices = np.array(vertices_list, dtype=np.float32).reshape(-1, 3)
+
+    def setup_buffers_gl(self):
+        if self.VAO is not None:
+            glDeleteVertexArrays(1, [self.VAO])
+            if self.VBO is not None:
+                glDeleteBuffers(1, [self.VBO])
+        self.VAO = glGenVertexArrays(1)
+        self.VBO = glGenBuffers(1)
+        glBindVertexArray(self.VAO)
+        glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
+        glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glBindVertexArray(0)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def set_shader(self, shader_program):
+        self.shader_program = shader_program
+
+    def update_transform(self, world_position, current_brush_radius):
+        self.position = np.array(world_position, dtype=np.float32)
+
+        rm_trans = np.array([
+            [1, 0, 0, self.position[0]],
+            [0, 1, 0, self.position[1]],
+            [0, 0, 1, self.position[2]],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        rm_scale = np.array([
+            [current_brush_radius, 0, 0, 0],
+            [0, 1, 0, 0],  # No y-scaling for the line brush
+            [0, 0, current_brush_radius, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        row_major_model = np.dot(rm_trans, rm_scale)
+        self.model_matrix = row_major_model.T
+
+    def draw(self, view_matrix, projection_matrix):
+        if not self.visible or not self.shader_program or not self.VAO:
+            return
+        glUseProgram(self.shader_program)
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "model"), 1, GL_FALSE, self.model_matrix)
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "view"), 1, GL_FALSE, view_matrix)
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "projection"), 1, GL_FALSE, projection_matrix)
+        glUniform4fv(glGetUniformLocation(self.shader_program, "brushColor"), 1, self.color)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glLineWidth(2.0)
+
+        glBindVertexArray(self.VAO)
+        glDrawArrays(GL_LINES, 0, len(self.vertices))
+        glBindVertexArray(0)
+
+        glLineWidth(1.0)
+        glDisable(GL_BLEND)
+
 def get_terrain_height_at_position(terrain_obj, world_x, world_z):
     """Get terrain height at a specific world position."""
     if not terrain_obj or 'vertices' not in terrain_obj:
@@ -491,6 +596,18 @@ class CubeOpenGLFrame(OpenGLFrame):
         self.sky_renderer = SkyRenderer()
         self.start_time = time.time()
 
+        # Initialize brush visualizer for terrain editing
+        try:
+            self.brush_shader = create_shader_program(BRUSH_VERTEX_SHADER, BRUSH_FRAGMENT_SHADER)
+            self.brush_visualizer = BrushVisualizer(segments=32)
+            self.brush_visualizer.set_shader(self.brush_shader)
+            self.brush_visualizer.setup_buffers_gl()
+            print("Brush visualizer initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to initialize brush visualizer: {e}")
+            self.brush_visualizer = None
+            self.brush_shader = None
+
     def _setup_high_quality_rendering(self):
         """Setup high-quality rendering pipeline from TheHigh V1."""
         # Enhanced lighting setup
@@ -674,6 +791,10 @@ class CubeOpenGLFrame(OpenGLFrame):
         self.rmb_down = False
 
     def on_mouse_move(self, event):
+        # Store mouse position for brush visualization
+        self.last_mouse_x = event.x
+        self.last_mouse_y = event.y
+
         # FPS mode - always capture mouse for looking
         if self.fps_mouse_sensitivity is not None:
             self._handle_fps_mouse_look(event.x, event.y)
@@ -712,6 +833,10 @@ class CubeOpenGLFrame(OpenGLFrame):
     def on_key_press(self, event):
         key = event.keysym.lower()
         self.keys_pressed.add(key)
+
+        # Handle ESC key to exit FPS mode
+        if key == 'escape' and self.fps_mouse_sensitivity is not None:
+            self.app.toggle_physics()  # Exit FPS mode
 
     def on_key_release(self, event):
         self.keys_pressed.discard(event.keysym.lower())
@@ -818,19 +943,21 @@ class CubeOpenGLFrame(OpenGLFrame):
         return moved
 
     def _handle_fps_mouse_look(self, mouse_x, mouse_y):
-        """Handle CS:GO-style mouse look for FPS mode."""
-        if self.first_mouse_move:
-            self.last_x = mouse_x
-            self.last_y = mouse_y
-            self.first_mouse_move = False
+        """Handle smooth mouse look for FPS mode with locked mouse."""
+        if not hasattr(self, 'fps_mouse_locked') or not self.fps_mouse_locked:
             return
 
-        # Calculate mouse offset
-        x_offset = mouse_x - self.last_x
-        y_offset = self.last_y - mouse_y  # Reversed since y-coordinates go from bottom to top
+        # Calculate center of frame
+        center_x = self.winfo_width() // 2
+        center_y = self.winfo_height() // 2
 
-        self.last_x = mouse_x
-        self.last_y = mouse_y
+        # Calculate offset from center
+        x_offset = mouse_x - center_x
+        y_offset = center_y - mouse_y  # Reversed since y-coordinates go from bottom to top
+
+        # Only process if there's significant movement to avoid jitter
+        if abs(x_offset) < 2 and abs(y_offset) < 2:
+            return
 
         # Apply sensitivity
         sensitivity = self.fps_mouse_sensitivity
@@ -849,6 +976,55 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         # Update camera vectors
         self._update_camera_vectors()
+
+        # Warp mouse back to center to keep it locked
+        self.after_idle(self._warp_mouse_to_center)
+
+    def _init_fps_mouse_lock(self):
+        """Initialize mouse locking for FPS mode."""
+        # Hide cursor
+        self.configure(cursor="none")
+
+        # Get center of the OpenGL frame
+        self.center_x = self.winfo_width() // 2
+        self.center_y = self.winfo_height() // 2
+
+        # Initialize mouse position tracking
+        self.fps_mouse_locked = True
+        self.first_mouse_move = True
+
+        # Warp mouse to center initially
+        self.after(10, self._warp_mouse_to_center)
+
+        print("Mouse locked and hidden for FPS mode")
+
+    def _exit_fps_mouse_lock(self):
+        """Exit mouse locking and restore cursor."""
+        # Show cursor
+        self.configure(cursor="")
+
+        # Reset mouse tracking
+        self.fps_mouse_locked = False
+        self.first_mouse_move = True
+
+        print("Mouse unlocked and cursor restored")
+
+    def _warp_mouse_to_center(self):
+        """Warp mouse to center of the frame."""
+        if hasattr(self, 'fps_mouse_locked') and self.fps_mouse_locked:
+            try:
+                # Get absolute position of the frame center
+                abs_x = self.winfo_rootx() + self.center_x
+                abs_y = self.winfo_rooty() + self.center_y
+
+                # Warp mouse to center
+                self.event_generate('<Motion>', warp=True, x=self.center_x, y=self.center_y)
+
+                # Update last known position to center
+                self.last_x = self.center_x
+                self.last_y = self.center_y
+            except Exception as e:
+                print(f"Mouse warp error: {e}")
 
     def _check_player_collision(self, new_position):
         """Check if player would collide with physics objects at new position."""
@@ -2218,6 +2394,56 @@ class CubeOpenGLFrame(OpenGLFrame):
                     glVertex3f(x, y, z)
             glEnd()
 
+    def _update_brush_position(self):
+        """Update brush visualizer position based on mouse cursor and terrain intersection."""
+        if not self.brush_visualizer:
+            return
+
+        # Get current mouse position (use last known position)
+        mouse_x = getattr(self, 'last_mouse_x', self.width // 2)
+        mouse_y = getattr(self, 'last_mouse_y', self.height // 2)
+
+        # Calculate ray from mouse position
+        ray_origin, ray_direction = self._screen_to_world_ray(mouse_x, mouse_y)
+
+        # Find intersection with terrain
+        brush_display_position = None
+        can_interact_here = False
+
+        if self.current_terrain_obj:
+            terrain_hit_point = ray_terrain_intersection(ray_origin, ray_direction, self.current_terrain_obj)
+
+            if terrain_hit_point is not None:
+                # Position brush slightly above terrain surface
+                brush_display_position = terrain_hit_point + np.array([0, 0.05, 0], dtype=np.float32)
+                can_interact_here = True
+            else:
+                # Position brush at fixed distance if no terrain hit
+                brush_display_position = ray_origin + ray_direction * 100.0
+                can_interact_here = False
+
+            # Update brush transform with current size
+            self.brush_visualizer.update_transform(brush_display_position, self.terrain_brush_size)
+
+            # Set brush visibility based on interaction capability
+            self.brush_visualizer.visible = True
+        else:
+            self.brush_visualizer.visible = False
+
+    def _draw_brush_visualizer(self, view_matrix, projection_matrix):
+        """Draw the brush visualizer circle."""
+        if not self.brush_visualizer or not self.brush_visualizer.visible:
+            return
+
+        # Disable depth testing for brush overlay
+        glDisable(GL_DEPTH_TEST)
+
+        # Draw the brush circle
+        self.brush_visualizer.draw(view_matrix, projection_matrix)
+
+        # Re-enable depth testing
+        glEnable(GL_DEPTH_TEST)
+
     def redraw(self):
         self._create_and_cache_missing_gl_textures()
 
@@ -2300,6 +2526,12 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Don't draw gizmos in FPS mode
         if self.fps_mouse_sensitivity is None:
             self._draw_selection_gizmo()
+
+        # Update and draw brush visualizer when in terrain editing mode
+        if (self.terrain_editing_mode and self.current_terrain_obj and
+            self.brush_visualizer and self.brush_shader):
+            self._update_brush_position()
+            self._draw_brush_visualizer(view_matrix_gl, projection_matrix_gl)
 
     def animate_task(self):
         self._update_camera_position()
@@ -2538,6 +2770,13 @@ class App(ctk.CTk):
         # Position menu near the File button
         file_menu.geometry("+100+50")
 
+        # Bring window to front
+        file_menu.transient(self)
+        file_menu.lift()
+        file_menu.focus_set()
+        file_menu.attributes("-topmost", True)
+        file_menu.after(100, lambda: file_menu.attributes("-topmost", False))
+
         # New Scene
         new_button = ctk.CTkButton(file_menu, text="New Scene", command=self.new_scene)
         new_button.pack(pady=5, padx=10, fill="x")
@@ -2562,6 +2801,13 @@ class App(ctk.CTk):
         edit_menu.resizable(False, False)
         edit_menu.geometry("+170+50")
 
+        # Bring window to front
+        edit_menu.transient(self)
+        edit_menu.lift()
+        edit_menu.focus_set()
+        edit_menu.attributes("-topmost", True)
+        edit_menu.after(100, lambda: edit_menu.attributes("-topmost", False))
+
         # Duplicate
         duplicate_button = ctk.CTkButton(edit_menu, text="Duplicate", command=self.duplicate_selected_object)
         duplicate_button.pack(pady=5, padx=10, fill="x")
@@ -2578,6 +2824,13 @@ class App(ctk.CTk):
         view_menu.resizable(False, False)
         view_menu.geometry("+240+50")
 
+        # Bring window to front
+        view_menu.transient(self)
+        view_menu.lift()
+        view_menu.focus_set()
+        view_menu.attributes("-topmost", True)
+        view_menu.after(100, lambda: view_menu.attributes("-topmost", False))
+
         # Toggle World Gizmo
         gizmo_button = ctk.CTkButton(
             view_menu, text="Toggle World Gizmo",
@@ -2592,6 +2845,13 @@ class App(ctk.CTk):
         gameobject_menu.geometry("200x225")
         gameobject_menu.resizable(False, False)
         gameobject_menu.geometry("+380+50")
+
+        # Bring window to front
+        gameobject_menu.transient(self)
+        gameobject_menu.lift()
+        gameobject_menu.focus_set()
+        gameobject_menu.attributes("-topmost", True)
+        gameobject_menu.after(100, lambda: gameobject_menu.attributes("-topmost", False))
 
         # Cube
         cube_button = ctk.CTkButton(gameobject_menu, text="Cube", command=self.create_cube)
@@ -2624,6 +2884,13 @@ class App(ctk.CTk):
         help_menu.geometry("300x200")
         help_menu.resizable(False, False)
         help_menu.geometry("+310+50")
+
+        # Bring window to front
+        help_menu.transient(self)
+        help_menu.lift()
+        help_menu.focus_set()
+        help_menu.attributes("-topmost", True)
+        help_menu.after(100, lambda: help_menu.attributes("-topmost", False))
 
         help_text = ctk.CTkTextbox(help_menu)
         help_text.pack(pady=10, padx=10, fill="both", expand=True)
@@ -2953,6 +3220,13 @@ class App(ctk.CTk):
         # Position window
         terrain_window.geometry("+400+200")
 
+        # Bring window to front
+        terrain_window.transient(self)  # Make it a transient window of the main window
+        terrain_window.lift()           # Bring to front
+        terrain_window.focus_set()      # Give focus to the window
+        terrain_window.attributes("-topmost", True)  # Keep on top initially
+        terrain_window.after(100, lambda: terrain_window.attributes("-topmost", False))  # Remove topmost after showing
+
         # Title label
         title_label = ctk.CTkLabel(terrain_window, text="Terrain Editor", font=ctk.CTkFont(size=16, weight="bold"))
         title_label.pack(pady=10)
@@ -3249,7 +3523,7 @@ class App(ctk.CTk):
             self.gl_frame._update_camera_vectors()
 
     def _enter_fps_mode(self):
-        """Enter FPS controller mode."""
+        """Enter FPS controller mode with mouse locking."""
         # Position player at ground level, slightly above
         self.gl_frame.camera_pos = np.array([0.0, 1.8, 0.0], dtype=np.float32)  # Eye level height
         self.gl_frame.camera_yaw = -90.0  # Look forward
@@ -3269,12 +3543,19 @@ class App(ctk.CTk):
         self.gl_frame.fps_on_ground = True
         self.gl_frame.fps_gravity = -15.0
 
-        print("FPS Controller: Use WASD to move, mouse to look, Space to jump")
+        # Initialize mouse locking
+        self.gl_frame._init_fps_mouse_lock()
+
+        print("FPS Controller: Use WASD to move, mouse to look, Space to jump, ESC to exit")
 
     def _exit_fps_mode(self):
-        """Exit FPS controller mode."""
+        """Exit FPS controller mode and restore mouse."""
         # Re-enable editing capabilities
         self.gl_frame.fps_mouse_sensitivity = None
+
+        # Restore mouse cursor and unlock
+        self.gl_frame._exit_fps_mouse_lock()
+
         print("Free fly camera restored")
 
     def _initialize_physics(self):
