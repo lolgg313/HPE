@@ -278,95 +278,192 @@ def create_shader_program(vertex_source, fragment_source):
 
 # --- Procedural Sky & Clouds GLSL Function Source ---
 PROCEDURAL_SKY_CLOUDS_FUNC_SRC = """
-// Pseudo-random generator (simple hash)
-float rand(vec2 co){
-    return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+
+// --- UTILITY FUNCTIONS (Noise Generation) ---
+
+/**
+ * @notice A simple pseudo-random number generator (hash function).
+ * @param p Input 2D vector.
+ * @return A pseudo-random float between 0.0 and 1.0.
+ */
+float hash(vec2 p) {
+    // [FIXED] Using a higher quality hash function (by Inigo Quilez). It produces a more
+    // uniformly distributed and less structured pseudo-random value, which is
+    // the first step in reducing grid-like artifacts in the final noise.
+    vec3 p3  = fract(vec3(p.xyx) * .1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
 }
 
-// Basic value noise function
+/**
+ * @notice 2D Value Noise function.
+ * @dev Generates smooth, continuous noise by interpolating random values at integer grid points.
+ * @param st The input coordinate (e.g., UV).
+ * @return A noise value between 0.0 and 1.0.
+ */
 float noise(vec2 st) {
-    vec2 i = floor(st);
-    vec2 f = fract(st);
-    // Smooth interpolation (smoothstep)
+    vec2 i = floor(st); // Integer part of the coordinate
+    vec2 f = fract(st); // Fractional part of the coordinate
+
+    // Hermite interpolation (smoothstep) for a smoother transition between cells.
+    // This avoids the blocky look of linear interpolation.
     vec2 u = f * f * (3.0 - 2.0 * f);
 
-    float a = rand(i);
-    float b = rand(i + vec2(1.0, 0.0));
-    float c = rand(i + vec2(0.0, 1.0));
-    float d = rand(i + vec2(1.0, 1.0));
+    // Sample random values at the four corners of the grid cell.
+    float a = hash(i + vec2(0.0, 0.0));
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
 
+    // Bilinearly interpolate the corner values.
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// Fractal Brownian Motion (FBM)
+/**
+ * @notice Fractal Brownian Motion (FBM).
+ * @dev Creates detailed and natural-looking textures by layering multiple octaves of noise
+ * at different frequencies and amplitudes.
+ * @param st The input coordinate.
+ * @param octaves The number of noise layers to combine. More octaves add more detail.
+ * @param persistence Controls the decrease in amplitude for each successive octave.
+ * @param lacunarity Controls the increase in frequency for each successive octave.
+ * @return A normalized FBM value between 0.0 and 1.0.
+ */
 float fbm(vec2 st, int octaves, float persistence, float lacunarity) {
     float total = 0.0;
     float frequency = 1.0;
     float amplitude = 1.0;
-    float maxValue = 0.0;
+    float maxValue = 0.0; // Used for normalization
+
     for (int i = 0; i < octaves; i++) {
         total += noise(st * frequency) * amplitude;
         maxValue += amplitude;
         amplitude *= persistence;
         frequency *= lacunarity;
     }
-    if (maxValue == 0.0) return 0.0; // Avoid division by zero
-    return total / maxValue; // Normalize to 0-1 range
+
+    // Normalize the result to the [0, 1] range to ensure consistent output.
+    if (maxValue == 0.0) return 0.0;
+    return total / maxValue;
 }
 
-// --- Cloud and Sky Appearance Constants ---
-const vec3 SKY_COLOR_ZENITH = vec3(0.15, 0.35, 0.7);
-const vec3 SKY_COLOR_HORIZON = vec3(0.4, 0.6, 0.85);
-const vec3 SUN_COLOR_EFFECT = vec3(1.0, 0.9, 0.7);
 
-const float CLOUD_SCALE = 1.3;
+// --- APPEARANCE UNIFORMS & CONSTANTS ---
+
+// Sky Colors (now as uniforms)
+uniform vec3 u_zenithColor;
+uniform vec3 u_horizonColor;
+const vec3 SUNSET_COLOR = vec3(0.9, 0.5, 0.2); // Orange/red for sunset
+
+// Sun Properties
+const vec3 SUN_COLOR = vec3(1.0, 0.95, 0.85);
+const float SUN_DISK_INTENSITY = 40.0; // Higher value = smaller, sharper sun
+const float SUN_HAZE_INTENSITY = 0.2;
+
+// Cloud Properties
+const float CLOUD_SCALE = 1.2;
 const vec2 CLOUD_SCROLL_SPEED = vec2(0.015, 0.008);
-const int CLOUD_OCTAVES = 5;
-const float CLOUD_PERSISTENCE = 0.45;
-const float CLOUD_LACUNARITY = 2.1;
-const float CLOUD_COVERAGE_FACTOR = 0.45;
-const float CLOUD_SHARPNESS = 0.3;
-const float CLOUD_DENSITY_FACTOR = 0.6;
+const int CLOUD_OCTAVES = 6;
+const float CLOUD_PERSISTENCE = 0.48;
+const float CLOUD_LACUNARITY = 2.2;
+const float CLOUD_COVERAGE = 0.5;
+const float CLOUD_SHARPNESS = 0.25;
+const float CLOUD_DENSITY = 0.7;
+const float CLOUD_WARP_STRENGTH = 0.3;
 
-const vec3 CLOUD_COLOR_LIGHT = vec3(0.95, 0.95, 1.0);
+// Cloud Lighting
+const vec3 CLOUD_COLOR_LIGHT = vec3(1.0, 1.0, 1.0);
 const vec3 CLOUD_COLOR_DARK_BASE = vec3(0.65, 0.7, 0.75);
-const float SUN_DISK_INTENSITY = 35.0;
-const float SUN_HAZE_INTENSITY = 0.15;
 
-// Main function to get procedural sky and cloud color
+// --- MAIN SHADER FUNCTION ---
+
+/**
+ * @notice Main function to calculate the final sky and cloud color for a given view direction.
+ * @param viewDirWorld The normalized view direction vector from the camera.
+ * @param currentTime A float representing time, used for animating the clouds.
+ * @param sunDirectionWorld The normalized direction vector pointing towards the sun.
+ * @return The final computed RGBA color for the pixel.
+ */
 vec3 getProceduralSkyAndCloudsColor(vec3 viewDirWorld, float currentTime, vec3 sunDirectionWorld) {
-    vec3 normViewDir = normalize(viewDirWorld);
 
-    // 1. Base Sky Gradient
-    float T = pow(max(0.0, normViewDir.y), 0.5);
-    vec3 skyGradient = mix(SKY_COLOR_HORIZON, SKY_COLOR_ZENITH, T);
+    // --- 1. ATMOSPHERE & SKY GRADIENT ---
 
-    // 2. Cloud Layer
-    vec2 cloudUV = normViewDir.xz / (abs(normViewDir.y) * 0.5 + 0.1 + 0.0001);
+    // Calculate sun's elevation. 1.0 at zenith, 0.0 at horizon, -1.0 at nadir.
+    float sunElevation = sunDirectionWorld.y;
+
+    // Sunset factor: smoothly transitions from 0 (day) to 1 (sunset) as the sun approaches the horizon.
+    float sunsetFactor = smoothstep(0.25, 0.0, sunElevation);
+
+    // Interpolate sky colors based on the sun's elevation.
+    vec3 zenithColor = mix(u_zenithColor, SUNSET_COLOR * 0.5, sunsetFactor);
+    vec3 horizonColor = mix(u_horizonColor, SUNSET_COLOR * 1.2, sunsetFactor);
+
+    // Calculate the base sky gradient based on the view direction's vertical component.
+    float skyGradientFactor = pow(max(0.0, viewDirWorld.y), 0.4);
+    vec3 skyColor = mix(horizonColor, zenithColor, skyGradientFactor);
+
+
+    // --- 2. CLOUD GENERATION ---
+
+    // Project view direction onto a 2D plane for cloud UVs. This mapping reduces distortion
+    // at the horizon compared to a simple linear mapping.
+    vec2 cloudUV = viewDirWorld.xz / (viewDirWorld.y * 2.0 + 0.5);
     cloudUV *= CLOUD_SCALE;
-    cloudUV += currentTime * CLOUD_SCROLL_SPEED;
+    cloudUV += currentTime * CLOUD_SCROLL_SPEED; // Animate clouds over time
 
-    float cloudNoiseVal = fbm(cloudUV, CLOUD_OCTAVES, CLOUD_PERSISTENCE, CLOUD_LACUNARITY);
+    // Apply Domain Warping to break up grid artifacts and create more organic shapes.
+    // We use two FBM calls with different offsets to create a vector field that displaces the main UVs.
+    vec2 warpOffset;
+    warpOffset.x = fbm(cloudUV + vec2(1.5, 7.8), 4, 0.5, 2.0); // Use fewer octaves for performance
+    warpOffset.y = fbm(cloudUV + vec2(9.2, 3.4), 4, 0.5, 2.0);
+    // Remap from [0, 1] to [-1, 1] and scale by strength
+    warpOffset = (warpOffset * 2.0 - 1.0) * CLOUD_WARP_STRENGTH;
+    vec2 warpedUV = cloudUV + warpOffset;
 
-    float cloudCoverageThreshold = 1.0 - CLOUD_COVERAGE_FACTOR;
-    float cloudMap = smoothstep(cloudCoverageThreshold - CLOUD_SHARPNESS, cloudCoverageThreshold + CLOUD_SHARPNESS, cloudNoiseVal);
-    cloudMap *= CLOUD_DENSITY_FACTOR;
+    // Generate the base cloud noise pattern using the warped UVs.
+    float cloudNoise = fbm(warpedUV, CLOUD_OCTAVES, CLOUD_PERSISTENCE, CLOUD_LACUNARITY);
 
-    // 3. Cloud Lighting
-    float viewSunDot = max(0.0, dot(normViewDir, sunDirectionWorld));
-    float cloudLightDot = max(0.0, dot(vec3(0.1, 0.9, 0.1), sunDirectionWorld));
-    cloudLightDot = mix(0.4, 1.0, cloudLightDot);
+    // Shape the noise into cloud forms using smoothstep to create soft edges.
+    float cloudCoverageThreshold = 1.0 - CLOUD_COVERAGE;
+    float cloudMap = smoothstep(cloudCoverageThreshold - CLOUD_SHARPNESS, cloudCoverageThreshold + CLOUD_SHARPNESS, cloudNoise);
+    cloudMap *= CLOUD_DENSITY;
 
-    vec3 cloudColor = mix(CLOUD_COLOR_DARK_BASE, CLOUD_COLOR_LIGHT, cloudLightDot);
-    cloudColor += SUN_COLOR_EFFECT * pow(viewSunDot, 8.0) * 0.5 * cloudMap;
+    // Fade clouds near the horizon for a more realistic sense of distance.
+    float horizonFade = smoothstep(0.0, 0.15, viewDirWorld.y);
+    cloudMap *= horizonFade;
 
-    // 4. Sun Disk / Haze
-    float sunDot = max(0.0, dot(normViewDir, sunDirectionWorld));
-    vec3 sunDisk = SUN_COLOR_EFFECT * pow(sunDot, SUN_DISK_INTENSITY);
-    vec3 sunHaze = SUN_COLOR_EFFECT * pow(sunDot, 2.0) * SUN_HAZE_INTENSITY;
 
-    // 5. Composite Final Color
-    vec3 finalColor = mix(skyGradient, cloudColor, cloudMap);
+    // --- 3. LIGHTING ---
+
+    // Calculate how directly the sun is shining towards the camera through the clouds.
+    float viewSunDot = max(0.0, dot(viewDirWorld, sunDirectionWorld));
+
+    // Sun Color: Make the sun itself more reddish at sunset.
+    vec3 dynamicSunColor = mix(SUN_COLOR, SUNSET_COLOR * 1.5, sunsetFactor);
+
+    // Sun Disk & Haze: Create a bright core and a softer surrounding glow.
+    vec3 sunDisk = dynamicSunColor * pow(viewSunDot, SUN_DISK_INTENSITY);
+    vec3 sunHaze = dynamicSunColor * pow(viewSunDot, 3.0) * SUN_HAZE_INTENSITY;
+
+    // Cloud Lighting:
+    // Base lighting is influenced by the sun's general direction.
+    float cloudLightFactor = max(0.0, dot(normalize(vec3(0.0, 1.0, 0.0)), sunDirectionWorld));
+    cloudLightFactor = mix(0.5, 1.0, cloudLightFactor);
+
+    // Tint cloud shadows with the ambient sky color for a more integrated look.
+    vec3 cloudShadowColor = mix(CLOUD_COLOR_DARK_BASE, skyColor * 0.8, 0.5);
+    vec3 cloudColor = mix(cloudShadowColor, CLOUD_COLOR_LIGHT, cloudLightFactor);
+
+    // Add "silver lining" effect where clouds are backlit by the sun.
+    cloudColor += dynamicSunColor * pow(viewSunDot, 12.0) * 0.7 * cloudMap;
+
+
+    // --- 4. COMPOSITION ---
+
+    // Blend the sky and clouds together using the generated cloud map.
+    vec3 finalColor = mix(skyColor, cloudColor, cloudMap);
+
+    // Add the sun haze and disk on top of everything.
     finalColor += sunHaze;
     finalColor += sunDisk;
 
@@ -447,13 +544,18 @@ class SkyRenderer:
         self.invViewMatrix_loc = glGetUniformLocation(self.shader_program, "invViewMatrix")
         self.time_loc = glGetUniformLocation(self.shader_program, "time")
         self.sunDirection_loc = glGetUniformLocation(self.shader_program, "sunDirection_World")
+        self.zenithColor_loc = glGetUniformLocation(self.shader_program, "u_zenithColor")
+        self.horizonColor_loc = glGetUniformLocation(self.shader_program, "u_horizonColor")
 
-    def draw(self, inv_projection_matrix, inv_view_matrix, current_time, sun_direction_world):
+    def draw(self, inv_projection_matrix, inv_view_matrix, current_time, sun_direction_world, zenith_color, horizon_color):
         glUseProgram(self.shader_program)
         glUniformMatrix4fv(self.invProjectionMatrix_loc, 1, GL_FALSE, inv_projection_matrix)
         glUniformMatrix4fv(self.invViewMatrix_loc, 1, GL_FALSE, inv_view_matrix)
         glUniform1f(self.time_loc, current_time)
         glUniform3fv(self.sunDirection_loc, 1, sun_direction_world)
+        # Pass the colors to the shader
+        glUniform3fv(self.zenithColor_loc, 1, zenith_color)
+        glUniform3fv(self.horizonColor_loc, 1, horizon_color)
 
         glBindVertexArray(self.VAO)
         glDrawArrays(GL_TRIANGLES, 0, 6)
@@ -2492,11 +2594,20 @@ class CubeOpenGLFrame(OpenGLFrame):
 
                 # Render sky behind everything
                 glDepthMask(GL_FALSE)
+
+                # Convert sky color to zenith and horizon colors
+                # Use the sky color as the base and create a gradient
+                sky_base = self.app.sky_color[:3]  # Get RGB only
+                zenith_color = [c * 0.8 for c in sky_base]  # Darker at zenith
+                horizon_color = [min(1.0, c * 1.2) for c in sky_base]  # Brighter at horizon
+
                 self.sky_renderer.draw(
                     inv_projection_matrix,
                     inv_view_matrix,
                     self.current_time_gl,
-                    sun_direction_world
+                    sun_direction_world,
+                    zenith_color,
+                    horizon_color
                 )
                 glDepthMask(GL_TRUE)
             except np.linalg.LinAlgError:
@@ -2992,9 +3103,8 @@ class App(ctk.CTk):
         if color[0]:  # If user didn't cancel
             # Convert RGB (0-255) to float (0-1)
             self.sky_color = [c/255.0 for c in color[0]] + [1.0]  # Add alpha
-            # Apply sky color immediately
-            glClearColor(self.sky_color[0], self.sky_color[1], self.sky_color[2], self.sky_color[3])
             print(f"Sky color changed to: {self.sky_color}")
+            # Sky color will be applied automatically in the next frame render
 
     def choose_halo_color(self):
         """Opens color picker for halo color."""
@@ -3227,6 +3337,17 @@ class App(ctk.CTk):
         terrain_window.attributes("-topmost", True)  # Keep on top initially
         terrain_window.after(100, lambda: terrain_window.attributes("-topmost", False))  # Remove topmost after showing
 
+        # Handle window closing - turn off terrain editing mode when window is closed
+        def on_terrain_window_close():
+            # Turn off terrain editing mode if it's enabled
+            if hasattr(self, 'terrain_editing_var') and self.terrain_editing_var.get():
+                self.terrain_editing_var.set(False)
+                self.gl_frame.set_terrain_editing_mode(False)
+                print("Terrain editing mode disabled (window closed)")
+            terrain_window.destroy()
+
+        terrain_window.protocol("WM_DELETE_WINDOW", on_terrain_window_close)
+
         # Title label
         title_label = ctk.CTkLabel(terrain_window, text="Terrain Editor", font=ctk.CTkFont(size=16, weight="bold"))
         title_label.pack(pady=10)
@@ -3455,9 +3576,27 @@ class App(ctk.CTk):
         """Check if object is a terrain object."""
         return obj.get('name', '').startswith('Terrain_') or obj.get('is_terrain', False)
 
+    def _is_terrain_editing_active(self):
+        """Check if terrain editing tools are currently active."""
+        return (hasattr(self, 'terrain_editing_var') and
+                self.terrain_editing_var is not None and
+                self.terrain_editing_var.get())
+
     def toggle_physics(self):
         """Toggle physics simulation and FPS mode on/off (Unity-like Play button)."""
         if not self.physics_enabled:
+            # Check if terrain editing tools are active
+            if self._is_terrain_editing_active():
+                # Show warning message
+                import tkinter.messagebox as messagebox
+                messagebox.showwarning(
+                    "Cannot Start Game",
+                    "Please first close editing tools.\n\nTerrain sculpting tools are currently active. "
+                    "Close the terrain editor window or disable terrain editing mode before starting the game."
+                )
+                print("Cannot start game: Terrain editing tools are active")
+                return
+
             # Start physics and FPS mode
             self._backup_scene()
             self._backup_camera()
@@ -4694,8 +4833,7 @@ class App(ctk.CTk):
                     print(f"Warning: Could not update sun button states: {e}")
                     self.sun_visible = True
 
-                # Apply sky color immediately
-                glClearColor(self.sky_color[0], self.sky_color[1], self.sky_color[2], self.sky_color[3])
+                # Sky color will be applied automatically in the next frame render
 
             # Load objects
             if "objects" in scene_data:
