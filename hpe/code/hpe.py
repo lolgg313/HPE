@@ -1677,10 +1677,11 @@ class CubeOpenGLFrame(OpenGLFrame):
             'position': np.array(translate, dtype=np.float32),
             'rotation': np.array(angles, dtype=np.float32), # Euler angles in radians
             'scale': np.array(scale, dtype=np.float32),
-            'pil_image_ref': pil_image_ref, 
+            'pil_image_ref': pil_image_ref,
             'base_color_factor': base_color_factor,
             'vertex_colors': None,
-            'is_transparent': base_color_factor[3] < 0.99 
+            'is_transparent': base_color_factor[3] < 0.99,
+            'script_file': None  # Script file path (portable, relative)
         }
         self.model_draw_list.append(part_data)
 
@@ -1877,6 +1878,15 @@ class CubeOpenGLFrame(OpenGLFrame):
                 mass_value = part.get('mass', 1.0 if physics_type != 'None' else 0.0)
                 self.app.mass_var.set(f"{mass_value:.2f}")
 
+                # --- Update Script Properties ---
+                script_file = part.get('script_file', None)
+                if script_file:
+                    self.app.script_file_var.set(script_file)
+                    self.app.script_file_label.configure(text=script_file)
+                else:
+                    self.app.script_file_var.set("None")
+                    self.app.script_file_label.configure(text="None")
+
                 self.app.set_properties_state("normal")
             else:
                 # No selection, clear and disable UI
@@ -1896,6 +1906,10 @@ class CubeOpenGLFrame(OpenGLFrame):
                 self.app.physics_type_var.set("None")
                 self.app.physics_shape_var.set("Cube")
                 self.app.mass_var.set("0.0")
+
+                # Clear script properties
+                self.app.script_file_var.set("None")
+                self.app.script_file_label.configure(text="None")
 
                 self.app.set_properties_state("disabled")
         finally:
@@ -2665,7 +2679,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Hamid PY Engine V1.4")
-        self.geometry("1200x850")
+        self.geometry("1235x850")
 
         # Initialize sun visibility BEFORE UI creation
         self.sun_visible = True
@@ -2729,7 +2743,7 @@ class App(ctk.CTk):
         self.gl_frame.grid(row=2, column=1, sticky="nsew", padx=5, pady=(0,10))
 
         # --- Properties Panel ---
-        self.properties_frame = ctk.CTkScrollableFrame(self, label_text="Properties", width=225)
+        self.properties_frame = ctk.CTkScrollableFrame(self, label_text="Properties", width=235)
         self.properties_frame.grid(row=2, column=2, sticky="ns", padx=(5,10), pady=(0,10))
 
         # --- Console Panel ---
@@ -4468,7 +4482,8 @@ class App(ctk.CTk):
                 'pil_image_ref': None,
                 'model_file': None,
                 'terrain_properties': terrain_properties,  # Add terrain-specific data
-                'is_terrain': True  # Mark as terrain for identification
+                'is_terrain': True,  # Mark as terrain for identification
+                'script_file': None  # Script file path (portable, relative)
             }
 
             # Add to scene
@@ -4620,6 +4635,27 @@ class App(ctk.CTk):
         self.mass_var.trace_add("write", self.update_mass_from_ui)
         row += 1
 
+        # --- Script Header ---
+        script_label = ctk.CTkLabel(self.properties_frame, text="Script", font=ctk.CTkFont(weight="bold"))
+        script_label.grid(row=row, column=0, columnspan=2, pady=(20, 5), sticky="w", padx=10)
+        row += 1
+
+        # Script File
+        script_file_label = ctk.CTkLabel(self.properties_frame, text="Script File:")
+        script_file_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
+
+        script_frame = ctk.CTkFrame(self.properties_frame, fg_color="transparent")
+        script_frame.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
+        script_frame.grid_columnconfigure(0, weight=1)
+
+        self.script_file_var = ctk.StringVar(value="None")
+        self.script_file_label = ctk.CTkLabel(script_frame, text="None", anchor="w")
+        self.script_file_label.grid(row=0, column=0, padx=2, sticky="ew")
+
+        self.add_script_button = ctk.CTkButton(script_frame, text="Add Script", width=80, command=self.add_script_to_object)
+        self.add_script_button.grid(row=0, column=1, padx=2)
+        row += 1
+
         # Store all interactive widgets to easily change their state
         self.interactive_widgets = [self.pos_x_entry, self.pos_y_entry, self.pos_z_entry,
                                     self.rot_x_entry, self.rot_y_entry, self.rot_z_entry,
@@ -4627,7 +4663,7 @@ class App(ctk.CTk):
                                     self.color_r_slider, self.color_g_slider, self.color_b_slider,
                                     self.duplicate_button, self.delete_button,
                                     self.physics_none_radio, self.physics_static_radio, self.physics_rigidbody_radio,
-                                    self.physics_shape_menu, self.mass_entry]
+                                    self.physics_shape_menu, self.mass_entry, self.add_script_button]
 
     def set_properties_state(self, state):
         """Enable or disable all widgets in the properties panel."""
@@ -4661,6 +4697,50 @@ class App(ctk.CTk):
         """Calls the delete method in the OpenGL frame."""
         self.gl_frame.delete_selected_part()
         self.gl_frame.focus_set()
+
+    def add_script_to_object(self):
+        """Opens a file dialog to select a script file for the selected object."""
+        if self.gl_frame.selected_part_index is None:
+            print("No object selected.")
+            return
+
+        # Open file dialog to select script file
+        from tkinter import filedialog
+        filepath = filedialog.askopenfilename(
+            title="Select Script File",
+            filetypes=[("Blob Script files", "*.blob"), ("All files", "*.*")]
+        )
+
+        if filepath:
+            # Convert to relative path for portability
+            try:
+                import os
+                relative_path = os.path.relpath(filepath)
+
+                # Update the selected object's script file
+                selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+                selected_obj['script_file'] = relative_path
+
+                # Update the UI
+                self.script_file_var.set(relative_path)
+                self.script_file_label.configure(text=relative_path)
+
+                print(f"Script assigned to object: {relative_path}")
+
+            except Exception as e:
+                print(f"Error setting script file: {e}")
+        else:
+            # User cancelled or no file selected - option to remove script
+            if hasattr(self, 'gl_frame') and self.gl_frame.selected_part_index is not None:
+                selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+                if selected_obj.get('script_file'):
+                    # Ask if user wants to remove the script
+                    import tkinter.messagebox as messagebox
+                    if messagebox.askyesno("Remove Script", "Do you want to remove the current script from this object?"):
+                        selected_obj['script_file'] = None
+                        self.script_file_var.set("None")
+                        self.script_file_label.configure(text="None")
+                        print("Script removed from object.")
 
     def new_scene(self):
         """Creates a new empty scene."""
@@ -4733,6 +4813,11 @@ class App(ctk.CTk):
                     }
                 }
 
+                # Add script file if present
+                script_file = obj.get('script_file')
+                if script_file:
+                    obj_data["script_file"] = script_file
+
                 # Add terrain-specific data if this is a terrain object
                 if obj.get('is_terrain', False) or obj.get('name', '').startswith('Terrain_'):
                     terrain_props = obj.get('terrain_properties')
@@ -4768,6 +4853,11 @@ class App(ctk.CTk):
                         "is_primitive": True,
                         "primitive_type": obj.get('primitive_type', 'cube')
                     }
+
+                    # Save enemy-specific properties if this is an enemy
+                    if obj.get('is_enemy', False):
+                        obj_data["primitive_data"]["is_enemy"] = True
+                        obj_data["primitive_data"]["enemy_speed"] = obj.get('enemy_speed', 1.0)
 
                 scene_data["objects"].append(obj_data)
 
@@ -4901,6 +4991,10 @@ class App(ctk.CTk):
                         new_obj['physics_shape'] = physics_data.get('physics_shape', 'Cube')
                         new_obj['mass'] = physics_data.get('mass', 1.0)
 
+                        # Restore script file
+                        script_file = obj_data.get('script_file')
+                        new_obj['script_file'] = script_file
+
                         print(f"Successfully loaded and positioned object: {obj_data.get('name', 'Loaded_Object')}")
                 else:
                     print(f"Warning: Could not load model from {model_file}")
@@ -4976,6 +5070,10 @@ class App(ctk.CTk):
             recreated_terrain['physics_shape'] = physics_data.get('physics_shape', '2DPlane')
             recreated_terrain['mass'] = physics_data.get('mass', 1.0)
 
+            # Restore script file
+            script_file = obj_data.get('script_file')
+            recreated_terrain['script_file'] = script_file
+
             # Add to scene
             self.gl_frame.model_draw_list.append(recreated_terrain)
 
@@ -5003,6 +5101,9 @@ class App(ctk.CTk):
             elif primitive_type == 'cylinder':
                 mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
             elif primitive_type == 'capsule':
+                mesh = trimesh.creation.capsule(radius=0.5, height=2.0, count=[32, 16])
+            elif primitive_type == 'enemy':
+                # Enemies are capsule-shaped
                 mesh = trimesh.creation.capsule(radius=0.5, height=2.0, count=[32, 16])
             else:
                 # Default to cube if unknown type
@@ -5033,7 +5134,18 @@ class App(ctk.CTk):
                 new_obj['physics_shape'] = physics_data.get('physics_shape', 'Cube')
                 new_obj['mass'] = physics_data.get('mass', 1.0)
 
-                print(f"Successfully recreated {primitive_type} primitive")
+                # Restore script file
+                script_file = obj_data.get('script_file')
+                new_obj['script_file'] = script_file
+
+                # Restore enemy-specific properties if this is an enemy
+                if primitive_data.get('is_enemy', False) or primitive_type == 'enemy':
+                    new_obj['is_enemy'] = True
+                    new_obj['enemy_speed'] = primitive_data.get('enemy_speed', 1.0)
+                    new_obj['enemy_target'] = None  # Runtime property, reset on load
+                    print(f"Successfully recreated enemy with speed {new_obj['enemy_speed']}")
+                else:
+                    print(f"Successfully recreated {primitive_type} primitive")
 
         except Exception as e:
             print(f"Error recreating primitive: {e}")
