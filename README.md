@@ -11,7 +11,7 @@
 [![Forks](https://img.shields.io/github/forks/lolgg313/HPE?style=social)](https://github.com/lolgg313/HPE/network)  
 [![Stars](https://img.shields.io/github/stars/lolgg313/HPE?style=social)](https://github.com/lolgg313/HPE/stargazers)
 
-> ✨ A lightweight Game engine!
+> ✨ A lightweight 3D Game engine purely made in python!
 
 > [!Note]
 > `Fixed` TERRAIN EDITOR ( TERRAIN EDITOR had been added with more set of tools. )
