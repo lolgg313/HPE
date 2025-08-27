@@ -744,7 +744,9 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Enhanced fog for depth (from TheHigh V1)
         glEnable(GL_FOG)
         glFogi(GL_FOG_MODE, GL_EXP2)
-        glFogfv(GL_FOG_COLOR, [0.6, 0.7, 0.9, 1.0])  # Sky color fog
+        # Use dynamic fog color from app
+        fog_color = self.app.get_current_fog_color()
+        glFogfv(GL_FOG_COLOR, fog_color)
         glFogf(GL_FOG_DENSITY, 0.01)  # Subtle fog
         glFogf(GL_FOG_START, 10.0)
         glFogf(GL_FOG_END, 100.0)
@@ -2568,6 +2570,10 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
+        # Update fog color every frame
+        fog_color = self.app.get_current_fog_color()
+        glFogfv(GL_FOG_COLOR, fog_color)
+
         # Setup projection matrix
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
@@ -2705,9 +2711,12 @@ class App(ctk.CTk):
         self.rotate_button = ctk.CTkButton(top_frame, text="Rotate (R)", command=lambda: self.set_gizmo_mode('rotate'))
         self.rotate_button.pack(side="left", padx=5)
 
-        # Sun and Sky Color buttons
+        # Fog and Sky Color buttons
+        self.fog_color_button = ctk.CTkButton(top_frame, text="Fog Color", command=self.choose_fog_color, width=80)
+        self.fog_color_button.pack(side="left", padx=(20, 5))
+
         self.sky_color_button = ctk.CTkButton(top_frame, text="Sky Color", command=self.choose_sky_color, width=80)
-        self.sky_color_button.pack(side="left", padx=(20, 5))
+        self.sky_color_button.pack(side="left", padx=5)
 
         self.halo_color_button = ctk.CTkButton(top_frame, text="Halo Color", command=self.choose_halo_color, width=80)
         self.halo_color_button.pack(side="left", padx=5)
@@ -2770,6 +2779,10 @@ class App(ctk.CTk):
         self.sun_color = [1.0, 0.9, 0.7, 1.0]  # Warm sun color
         self.sky_color = [0.6, 0.7, 0.9, 1.0]  # Beautiful sky color from TheHigh V1
         self.halo_color = [1.0, 0.9, 0.7, 0.15]  # Default halo color
+
+        # Fog color settings
+        self.fog_auto_color = True  # True for auto color, False for manual color
+        self.fog_manual_color = [0.6, 0.7, 0.9, 1.0]  # Manual fog color (default to sky color)
 
         # Physics system
         self.physics_enabled = False
@@ -3119,6 +3132,8 @@ class App(ctk.CTk):
             self.sky_color = [c/255.0 for c in color[0]] + [1.0]  # Add alpha
             print(f"Sky color changed to: {self.sky_color}")
             # Sky color will be applied automatically in the next frame render
+            # Also update fog color if in auto mode
+            self.gl_frame.event_generate("<Expose>")
 
     def choose_halo_color(self):
         """Opens color picker for halo color."""
@@ -3137,6 +3152,114 @@ class App(ctk.CTk):
             # Convert RGB (0-255) to float (0-1), keep original alpha
             self.halo_color = [c/255.0 for c in color[0]] + [self.halo_color[3]]  # Keep alpha
             print(f"Halo color changed to: {self.halo_color}")
+
+    def choose_fog_color(self):
+        """Opens fog color selection popup with auto/manual options."""
+        fog_popup = ctk.CTkToplevel(self)
+        fog_popup.title("Fog Color Settings")
+        fog_popup.geometry("300x200")
+        fog_popup.resizable(False, False)
+
+        # Make popup appear in front
+        fog_popup.transient(self)
+        fog_popup.grab_set()
+        fog_popup.lift()
+        fog_popup.focus_set()
+
+        # Center the popup
+        fog_popup.update_idletasks()
+        x = (fog_popup.winfo_screenwidth() // 2) - (300 // 2)
+        y = (fog_popup.winfo_screenheight() // 2) - (200 // 2)
+        fog_popup.geometry(f"300x200+{x}+{y}")
+
+        # Main frame
+        main_frame = ctk.CTkFrame(fog_popup)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Title
+        title_label = ctk.CTkLabel(main_frame, text="Fog Color Options", font=ctk.CTkFont(size=16, weight="bold"))
+        title_label.pack(pady=(10, 20))
+
+        # Radio button variable
+        fog_mode_var = ctk.StringVar(value="auto" if self.fog_auto_color else "manual")
+
+        # Auto color radio button
+        auto_radio = ctk.CTkRadioButton(main_frame, text="Auto Color (similar to sky)",
+                                       variable=fog_mode_var, value="auto")
+        auto_radio.pack(pady=5, anchor="w")
+
+        # Manual color radio button
+        manual_radio = ctk.CTkRadioButton(main_frame, text="Choose Color",
+                                         variable=fog_mode_var, value="manual")
+        manual_radio.pack(pady=5, anchor="w")
+
+        # Color picker button (initially disabled if auto is selected)
+        def update_color_button_state():
+            if fog_mode_var.get() == "manual":
+                color_button.configure(state="normal")
+            else:
+                color_button.configure(state="disabled")
+
+        color_button = ctk.CTkButton(main_frame, text="Pick Color",
+                                    # --- BUG FIX --- Pass the radio button variable to the picker function
+                                    command=lambda: self.pick_fog_color(fog_popup, fog_mode_var),
+                                    state="disabled" if self.fog_auto_color else "normal")
+        color_button.pack(pady=10)
+
+        # Update button state when radio buttons change
+        auto_radio.configure(command=update_color_button_state)
+        manual_radio.configure(command=update_color_button_state)
+
+        # OK and Cancel buttons
+        button_frame = ctk.CTkFrame(main_frame)
+        button_frame.pack(pady=(10, 0), fill="x")
+
+        def apply_fog_settings():
+            self.fog_auto_color = (fog_mode_var.get() == "auto")
+            print(f"Fog color mode set to: {'Auto' if self.fog_auto_color else 'Manual'}")
+            # Trigger a redraw to apply the new fog color immediately
+            self.gl_frame.event_generate("<Expose>")
+            fog_popup.destroy()
+
+        def cancel_fog_settings():
+            fog_popup.destroy()
+
+        ok_button = ctk.CTkButton(button_frame, text="OK", command=apply_fog_settings)
+        ok_button.pack(side="left", padx=(0, 5), expand=True, fill="x")
+
+        cancel_button = ctk.CTkButton(button_frame, text="Cancel", command=cancel_fog_settings)
+        cancel_button.pack(side="right", padx=(5, 0), expand=True, fill="x")
+
+    def pick_fog_color(self, parent_popup, fog_mode_var):
+        """Opens color picker for manual fog color selection."""
+        import tkinter.colorchooser as colorchooser
+
+        # Convert current manual fog color to hex for color picker
+        current_rgb = tuple(int(c * 255) for c in self.fog_manual_color[:3])
+        current_hex = f"#{current_rgb[0]:02x}{current_rgb[1]:02x}{current_rgb[2]:02x}"
+
+        color = colorchooser.askcolor(color=current_hex, title="Choose Fog Color")
+        if color[0]:  # If user didn't cancel
+            # Convert RGB (0-255) to float (0-1)
+            self.fog_manual_color = [c/255.0 for c in color[0]] + [1.0]  # Add alpha
+            print(f"Manual fog color changed to: {self.fog_manual_color}")
+
+            # --- BUG FIX ---
+            # Set mode to manual and update the UI to reflect the change immediately.
+            self.fog_auto_color = False
+            fog_mode_var.set("manual")
+
+            # Trigger a redraw to apply the new fog color immediately
+            self.gl_frame.event_generate("<Expose>")
+
+    def get_current_fog_color(self):
+        """Returns the current fog color based on auto/manual setting."""
+        if self.fog_auto_color:
+            # Use sky color for auto fog
+            return self.sky_color
+        else:
+            # Use manually selected fog color
+            return self.fog_manual_color
 
     def toggle_sun_visibility(self):
         """Toggle sun and halo visibility and update button states."""
@@ -4786,7 +4909,9 @@ class App(ctk.CTk):
                     "sun_color": [float(x) for x in self.sun_color],
                     "sky_color": [float(x) for x in self.sky_color],
                     "halo_color": [float(x) for x in self.halo_color],
-                    "sun_visible": bool(self.sun_visible)
+                    "sun_visible": bool(self.sun_visible),
+                    "fog_auto_color": bool(self.fog_auto_color),
+                    "fog_manual_color": [float(x) for x in self.fog_manual_color]
                 },
                 "objects": []
             }
@@ -4903,6 +5028,11 @@ class App(ctk.CTk):
                 self.sun_color = env_data.get("sun_color", [1.0, 1.0, 0.95, 1.0])
                 self.sky_color = env_data.get("sky_color", [0.53, 0.81, 0.92, 1.0])
                 self.halo_color = env_data.get("halo_color", [1.0, 0.9, 0.7, 0.15])
+
+                # Restore fog color settings
+                self.fog_auto_color = env_data.get("fog_auto_color", True)
+                self.fog_manual_color = env_data.get("fog_manual_color", [0.6, 0.7, 0.9, 1.0])
+                print(f"Loading fog settings - Auto: {self.fog_auto_color}, Manual color: {self.fog_manual_color}")
 
                 # Restore sun visibility state
                 self.sun_visible = env_data.get("sun_visible", True)
