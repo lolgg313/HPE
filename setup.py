@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="hpe",
-    version="2.2.9",
+    version="2.2.95",
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
