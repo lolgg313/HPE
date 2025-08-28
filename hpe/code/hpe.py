@@ -3183,42 +3183,45 @@ class App(ctk.CTk):
         # Radio button variable
         fog_mode_var = ctk.StringVar(value="auto" if self.fog_auto_color else "manual")
 
+        # Color picker button (defined early to be used in the command)
+        color_button = ctk.CTkButton(main_frame, text="Pick Color",
+                                    command=lambda: self.pick_fog_color(fog_popup, fog_mode_var))
+
+        # --- FIX: New function to update state immediately ---
+        def _update_fog_mode():
+            # Get the value from the UI variable
+            is_auto = (fog_mode_var.get() == "auto")
+
+            # 1. Update the main application state directly
+            self.fog_auto_color = is_auto
+
+            # 2. Update the color picker button's state
+            color_button.configure(state="disabled" if is_auto else "normal")
+
+            # 3. Print status and redraw to apply changes visually
+            print(f"Fog color mode set to: {'Auto' if self.fog_auto_color else 'Manual'}")
+            self.gl_frame.event_generate("<Expose>")
+
         # Auto color radio button
         auto_radio = ctk.CTkRadioButton(main_frame, text="Auto Color (similar to sky)",
-                                       variable=fog_mode_var, value="auto")
+                                       variable=fog_mode_var, value="auto", command=_update_fog_mode)
         auto_radio.pack(pady=5, anchor="w")
 
         # Manual color radio button
         manual_radio = ctk.CTkRadioButton(main_frame, text="Choose Color",
-                                         variable=fog_mode_var, value="manual")
+                                         variable=fog_mode_var, value="manual", command=_update_fog_mode)
         manual_radio.pack(pady=5, anchor="w")
 
-        # Color picker button (initially disabled if auto is selected)
-        def update_color_button_state():
-            if fog_mode_var.get() == "manual":
-                color_button.configure(state="normal")
-            else:
-                color_button.configure(state="disabled")
-
-        color_button = ctk.CTkButton(main_frame, text="Pick Color",
-                                    # --- BUG FIX --- Pass the radio button variable to the picker function
-                                    command=lambda: self.pick_fog_color(fog_popup, fog_mode_var),
-                                    state="disabled" if self.fog_auto_color else "normal")
+        # Now pack the color button and set its initial state
         color_button.pack(pady=10)
-
-        # Update button state when radio buttons change
-        auto_radio.configure(command=update_color_button_state)
-        manual_radio.configure(command=update_color_button_state)
+        color_button.configure(state="disabled" if self.fog_auto_color else "normal")
 
         # OK and Cancel buttons
         button_frame = ctk.CTkFrame(main_frame)
         button_frame.pack(pady=(10, 0), fill="x")
 
         def apply_fog_settings():
-            self.fog_auto_color = (fog_mode_var.get() == "auto")
-            print(f"Fog color mode set to: {'Auto' if self.fog_auto_color else 'Manual'}")
-            # Trigger a redraw to apply the new fog color immediately
-            self.gl_frame.event_generate("<Expose>")
+            # State is already updated by radio buttons, just close the window
             fog_popup.destroy()
 
         def cancel_fog_settings():
