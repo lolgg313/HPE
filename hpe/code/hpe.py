@@ -35,6 +35,7 @@ import ctypes
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
 
 import pygame
 pygame.init()
@@ -569,6 +570,17 @@ class CubeOpenGLFrame(OpenGLFrame):
         self._after_id = None
         self._is_updating_ui = False # Flag to prevent recursive updates
 
+        # FXAA (Fast Approximate Anti-Aliasing) variables
+        self.fxaa_enabled = True
+        self.fxaa_shader_program = None
+        self.fxaa_fbo = None
+        self.fxaa_color_texture = None
+        self.fxaa_depth_texture = None
+        self.fxaa_vao = None
+        self.fxaa_vbo = None
+        self.screen_width = 800
+        self.screen_height = 600
+
         # --- Camera Attributes ---
         self.camera_pos = np.array([0.0, 1.0, 5.0], dtype=np.float32)
         self.camera_front = np.array([0.0, 0.0, -1.0], dtype=np.float32)
@@ -656,6 +668,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         self.bind("<FocusIn>", lambda e: self.focus_set())
 
 
+
     def initgl(self):
         print("initgl called")
         glViewport(0, 0, self.width, self.height)
@@ -672,6 +685,9 @@ class CubeOpenGLFrame(OpenGLFrame):
 
         # Enable antialiasing
         glEnable(GL_MULTISAMPLE)
+
+        # Setup FXAA anti-aliasing
+        self._setup_fxaa()
 
         # Setup high-quality rendering pipeline
         self._setup_high_quality_rendering()
@@ -709,6 +725,173 @@ class CubeOpenGLFrame(OpenGLFrame):
             print(f"Warning: Failed to initialize brush visualizer: {e}")
             self.brush_visualizer = None
             self.brush_shader = None
+
+    def _setup_fxaa(self):
+        """Setup FXAA (Fast Approximate Anti-Aliasing) using framebuffer objects and post-processing."""
+        try:
+            # Create FXAA shader program
+            self._create_fxaa_shaders()
+
+            # Create framebuffer for FXAA
+            self._create_fxaa_framebuffer()
+
+            # Create screen quad for FXAA post-processing
+            self._create_fxaa_screen_quad()
+
+            print("FXAA anti-aliasing initialized successfully")
+
+        except Exception as e:
+            print(f"Warning: Failed to initialize FXAA: {e}")
+            self.fxaa_enabled = False
+
+    def _create_fxaa_shaders(self):
+        """Create FXAA vertex and fragment shaders."""
+        # FXAA Vertex Shader
+        fxaa_vertex_shader = """
+        #version 330 core
+        layout (location = 0) in vec2 aPos;
+        layout (location = 1) in vec2 aTexCoord;
+
+        out vec2 TexCoord;
+
+        void main()
+        {
+            gl_Position = vec4(aPos.x, aPos.y, 0.0, 1.0);
+            TexCoord = aTexCoord;
+        }
+        """
+
+        # FXAA Fragment Shader
+        fxaa_fragment_shader = """
+        #version 330 core
+        out vec4 FragColor;
+
+        in vec2 TexCoord;
+
+        uniform sampler2D screenTexture;
+        uniform vec2 screenSize;
+
+        // FXAA parameters
+        const float FXAA_SPAN_MAX = 8.0;
+        const float FXAA_REDUCE_MUL = 1.0/8.0;
+        const float FXAA_REDUCE_MIN = 1.0/128.0;
+
+        void main()
+        {
+            vec2 texelStep = 1.0 / screenSize;
+
+            // Sample the center and surrounding pixels
+            vec3 rgbNW = texture(screenTexture, TexCoord + vec2(-1.0, -1.0) * texelStep).rgb;
+            vec3 rgbNE = texture(screenTexture, TexCoord + vec2(1.0, -1.0) * texelStep).rgb;
+            vec3 rgbSW = texture(screenTexture, TexCoord + vec2(-1.0, 1.0) * texelStep).rgb;
+            vec3 rgbSE = texture(screenTexture, TexCoord + vec2(1.0, 1.0) * texelStep).rgb;
+            vec3 rgbM  = texture(screenTexture, TexCoord).rgb;
+
+            // Convert to luma
+            vec3 luma = vec3(0.299, 0.587, 0.114);
+            float lumaNW = dot(rgbNW, luma);
+            float lumaNE = dot(rgbNE, luma);
+            float lumaSW = dot(rgbSW, luma);
+            float lumaSE = dot(rgbSE, luma);
+            float lumaM  = dot(rgbM,  luma);
+
+            float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+            float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+            vec2 dir;
+            dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+            dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+            float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * FXAA_REDUCE_MUL), FXAA_REDUCE_MIN);
+            float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+
+            dir = min(vec2(FXAA_SPAN_MAX, FXAA_SPAN_MAX),
+                      max(vec2(-FXAA_SPAN_MAX, -FXAA_SPAN_MAX),
+                          dir * rcpDirMin)) * texelStep;
+
+            vec3 rgbA = 0.5 * (
+                texture(screenTexture, TexCoord + dir * (1.0/3.0 - 0.5)).rgb +
+                texture(screenTexture, TexCoord + dir * (2.0/3.0 - 0.5)).rgb);
+            vec3 rgbB = rgbA * 0.5 + 0.25 * (
+                texture(screenTexture, TexCoord + dir * -0.5).rgb +
+                texture(screenTexture, TexCoord + dir * 0.5).rgb);
+
+            float lumaB = dot(rgbB, luma);
+
+            if ((lumaB < lumaMin) || (lumaB > lumaMax)) {
+                FragColor = vec4(rgbA, 1.0);
+            } else {
+                FragColor = vec4(rgbB, 1.0);
+            }
+        }
+        """
+
+        # Compile shaders
+        self.fxaa_shader_program = create_shader_program(fxaa_vertex_shader, fxaa_fragment_shader)
+
+    def _create_fxaa_framebuffer(self):
+        """Create framebuffer for FXAA rendering."""
+        # Get current viewport size
+        viewport = glGetIntegerv(GL_VIEWPORT)
+        self.screen_width = viewport[2]
+        self.screen_height = viewport[3]
+
+        # Generate framebuffer
+        self.fxaa_fbo = glGenFramebuffers(1)
+        glBindFramebuffer(GL_FRAMEBUFFER, self.fxaa_fbo)
+
+        # Create color texture
+        self.fxaa_color_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.fxaa_color_texture)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.screen_width, self.screen_height, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.fxaa_color_texture, 0)
+
+        # Create depth texture
+        self.fxaa_depth_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.fxaa_depth_texture)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, self.screen_width, self.screen_height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, None)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, self.fxaa_depth_texture, 0)
+
+        # Check framebuffer completeness
+        if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+            raise Exception("FXAA framebuffer not complete")
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+    def _create_fxaa_screen_quad(self):
+        """Create screen quad for FXAA post-processing."""
+        # Screen quad vertices (position and texture coordinates)
+        quad_vertices = np.array([
+            # positions   # texCoords
+            -1.0,  1.0,   0.0, 1.0,
+            -1.0, -1.0,   0.0, 0.0,
+             1.0, -1.0,   1.0, 0.0,
+            -1.0,  1.0,   0.0, 1.0,
+             1.0, -1.0,   1.0, 0.0,
+             1.0,  1.0,   1.0, 1.0
+        ], dtype=np.float32)
+
+        # Generate VAO and VBO
+        self.fxaa_vao = glGenVertexArrays(1)
+        self.fxaa_vbo = glGenBuffers(1)
+
+        glBindVertexArray(self.fxaa_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.fxaa_vbo)
+        glBufferData(GL_ARRAY_BUFFER, quad_vertices.nbytes, quad_vertices, GL_STATIC_DRAW)
+
+        # Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+
+        # Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
+        glEnableVertexAttribArray(1)
+
+        glBindVertexArray(0)
 
     def _setup_high_quality_rendering(self):
         """Setup high-quality rendering pipeline from TheHigh V1."""
@@ -1958,7 +2141,7 @@ class CubeOpenGLFrame(OpenGLFrame):
 
             # Update gizmo and redraw
             self._update_gizmo_collision_meshes()
-            self.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
         except (ValueError, TypeError) as e:
             # Handle cases where entry text is not a valid number
@@ -2174,7 +2357,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         if self.selected_part_index is not None:
             self._update_gizmo_collision_meshes()
 
-        self.event_generate("<Expose>")
+        # Rendering will be handled by animate_task automatically
 
 
     # -------------------------------------------------------------------
@@ -2568,6 +2751,14 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Update time for cloud animation
         self.current_time_gl = time.time() - self.start_time
 
+        # If FXAA is enabled, render to framebuffer first
+        if self.fxaa_enabled and self.fxaa_fbo:
+            self._render_with_fxaa()
+        else:
+            self._render_scene()
+
+    def _render_scene(self):
+        """Render the main scene."""
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # Update fog color every frame
@@ -2664,6 +2855,45 @@ class CubeOpenGLFrame(OpenGLFrame):
             self._update_brush_position()
             self._draw_brush_visualizer(view_matrix_gl, projection_matrix_gl)
 
+    def _render_with_fxaa(self):
+        """Render scene with FXAA anti-aliasing."""
+        # First pass: Render scene to framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, self.fxaa_fbo)
+        glViewport(0, 0, self.screen_width, self.screen_height)
+
+        # Render the scene normally
+        self._render_scene()
+
+        # Second pass: Apply FXAA and render to screen
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
+        glViewport(0, 0, self.width, self.height)
+        glClear(GL_COLOR_BUFFER_BIT)
+
+        # Disable depth testing for screen quad
+        glDisable(GL_DEPTH_TEST)
+
+        # Use FXAA shader
+        glUseProgram(self.fxaa_shader_program)
+
+        # Bind the rendered texture
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.fxaa_color_texture)
+        glUniform1i(glGetUniformLocation(self.fxaa_shader_program, "screenTexture"), 0)
+
+        # Set screen size uniform
+        glUniform2f(glGetUniformLocation(self.fxaa_shader_program, "screenSize"),
+                   float(self.screen_width), float(self.screen_height))
+
+        # Render screen quad
+        glBindVertexArray(self.fxaa_vao)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+        glBindVertexArray(0)
+
+        # Re-enable depth testing
+        glEnable(GL_DEPTH_TEST)
+
+        glUseProgram(0)
+
     def animate_task(self):
         self._update_camera_position()
         self.event_generate("<Expose>")
@@ -2672,6 +2902,24 @@ class CubeOpenGLFrame(OpenGLFrame):
     def cleanup_gl_resources(self):
         print("Cleaning up GL resources...")
         self._cleanup_old_model_resources()
+
+        # Cleanup FXAA resources
+        try:
+            if self.fxaa_fbo:
+                glDeleteFramebuffers(1, [self.fxaa_fbo])
+            if self.fxaa_color_texture:
+                glDeleteTextures(1, [self.fxaa_color_texture])
+            if self.fxaa_depth_texture:
+                glDeleteTextures(1, [self.fxaa_depth_texture])
+            if self.fxaa_vao:
+                glDeleteVertexArrays(1, [self.fxaa_vao])
+            if self.fxaa_vbo:
+                glDeleteBuffers(1, [self.fxaa_vbo])
+            if self.fxaa_shader_program:
+                glDeleteProgram(self.fxaa_shader_program)
+            print("FXAA resources cleaned up")
+        except Exception as e:
+            print(f"Error cleaning up FXAA resources: {e}")
 
         # Cleanup threading resources
         try:
@@ -3133,7 +3381,7 @@ class App(ctk.CTk):
             print(f"Sky color changed to: {self.sky_color}")
             # Sky color will be applied automatically in the next frame render
             # Also update fog color if in auto mode
-            self.gl_frame.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
     def choose_halo_color(self):
         """Opens color picker for halo color."""
@@ -3200,7 +3448,7 @@ class App(ctk.CTk):
 
             # 3. Print status and redraw to apply changes visually
             print(f"Fog color mode set to: {'Auto' if self.fog_auto_color else 'Manual'}")
-            self.gl_frame.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
         # Auto color radio button
         auto_radio = ctk.CTkRadioButton(main_frame, text="Auto Color (similar to sky)",
@@ -3253,7 +3501,7 @@ class App(ctk.CTk):
             fog_mode_var.set("manual")
 
             # Trigger a redraw to apply the new fog color immediately
-            self.gl_frame.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
     def get_current_fog_color(self):
         """Returns the current fog color based on auto/manual setting."""
@@ -3297,7 +3545,8 @@ class App(ctk.CTk):
 
             # Force redraw to update the scene
             if hasattr(self, 'gl_frame') and self.gl_frame:
-                self.gl_frame.event_generate("<Expose>")
+                # Rendering will be handled by animate_task automatically
+                pass
 
         except Exception as e:
             print(f"Error toggling sun visibility: {e}")
@@ -3405,7 +3654,7 @@ class App(ctk.CTk):
                 self.update_hierarchy_list()
 
                 # Refresh display
-                self.gl_frame.event_generate("<Expose>")
+                # Rendering will be handled by animate_task automatically
 
                 print(f"Created {name} primitive")
 
@@ -3452,7 +3701,7 @@ class App(ctk.CTk):
                 self.update_hierarchy_list()
 
                 # Refresh display
-                self.gl_frame.event_generate("<Expose>")
+                # Rendering will be handled by animate_task automatically
 
                 print(f"Created {name} enemy")
 
@@ -4625,7 +4874,7 @@ class App(ctk.CTk):
             self.update_hierarchy_list()
 
             # Refresh display
-            self.gl_frame.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
             print(f"Created terrain plane: {x_size/1000:.1f}km x {y_size/1000:.1f}km")
 
@@ -5067,7 +5316,7 @@ class App(ctk.CTk):
             self.gl_frame.model_loaded = True
             self.gl_frame._update_properties_panel()
             self.update_hierarchy_list()
-            self.gl_frame.event_generate("<Expose>")
+            # Rendering will be handled by animate_task automatically
 
             print(f"Scene loaded successfully from: {filepath}")
 
