@@ -32,7 +32,7 @@ dependencies = [
     "numpy==2.2.6",
     "packaging==25.0",
     "pillow==11.3.0",
-    "pygame==2.6.1",
+    "pygame-ce>=2.5, <3",
     "PyOpenGL==3.1.9",
     "pyopengltk==0.0.4",
     "toml==0.10.2",
