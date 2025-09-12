@@ -2038,6 +2038,11 @@ class CubeOpenGLFrame(OpenGLFrame):
                 self.app.color_g_label.configure(text=f"G: {int(color[1]*255)}")
                 self.app.color_b_label.configure(text=f"B: {int(color[2]*255)}")
 
+                # ---------- alpha ----------  <-- NEW
+                alpha = part['base_color_factor'][3]
+                self.app.alpha_slider.set(alpha)
+                self.app.alpha_label.configure(text=f"A: {int(alpha*255)}")
+
                 # --- Update Physics Properties ---
                 physics_type = part.get('physics_type', 'None')
                 physics_shape = part.get('physics_shape', 'Cube')
@@ -2086,6 +2091,10 @@ class CubeOpenGLFrame(OpenGLFrame):
                 self.app.color_r_label.configure(text="R: -")
                 self.app.color_g_label.configure(text="G: -")
                 self.app.color_b_label.configure(text="B: -")
+
+                # Clear alpha slider  <-- NEW
+                self.app.alpha_slider.set(0)
+                self.app.alpha_label.configure(text="A: -")
 
                 # Clear physics properties
                 self.app.physics_type_var.set("None")
@@ -2137,6 +2146,12 @@ class CubeOpenGLFrame(OpenGLFrame):
             self.app.color_r_label.configure(text=f"R: {int(r*255)}")
             self.app.color_g_label.configure(text=f"G: {int(g*255)}")
             self.app.color_b_label.configure(text=f"B: {int(b*255)}")
+
+            # ---------- alpha ----------  <-- NEW
+            alpha = self.app.alpha_slider.get()
+            part['base_color_factor'][3] = alpha
+            part['is_transparent'] = alpha < 0.99  # Update transparency flag
+            self.app.alpha_label.configure(text=f"A: {int(alpha*255)}")
 
 
             # Update gizmo and redraw
@@ -4952,6 +4967,14 @@ class App(ctk.CTk):
         self.color_b_label = ctk.CTkLabel(self.properties_frame, text="B: -"); self.color_b_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
         self.color_b_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1, command=self.update_model_from_ui_callback); self.color_b_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew"); row += 1
 
+        # ---------- alpha (transparency) ----------  <-- NEW
+        self.alpha_label = ctk.CTkLabel(self.properties_frame, text="A: -")
+        self.alpha_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
+        self.alpha_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1,
+                                          command=self.update_model_from_ui_callback)
+        self.alpha_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew")
+        row += 1
+
         # --- Actions Header ---
         actions_label = ctk.CTkLabel(self.properties_frame, text="Actions", font=ctk.CTkFont(weight="bold"))
         actions_label.grid(row=row, column=0, columnspan=2, pady=(20, 5), sticky="w", padx=10)
@@ -5036,6 +5059,7 @@ class App(ctk.CTk):
                                     self.rot_x_entry, self.rot_y_entry, self.rot_z_entry,
                                     self.scale_x_entry, self.scale_y_entry, self.scale_z_entry,
                                     self.color_r_slider, self.color_g_slider, self.color_b_slider,
+                                    self.alpha_slider,   # <-- NEW
                                     self.duplicate_button, self.delete_button,
                                     self.physics_none_radio, self.physics_static_radio, self.physics_rigidbody_radio,
                                     self.physics_shape_menu, self.mass_entry, self.add_script_button]
