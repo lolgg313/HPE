@@ -17,7 +17,8 @@ setup(
         "PyOpenGL==3.1.9",
         "pyopengltk==0.0.4",
         "toml==0.10.2",
-        "trimesh==4.7.1"
+        "trimesh==4.7.1",
+        "rtree==1.4.1"
     ],
     entry_points={
         "console_scripts": [
