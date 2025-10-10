@@ -277,7 +277,49 @@ def create_shader_program(vertex_source, fragment_source):
     glDeleteShader(vertex_shader); glDeleteShader(fragment_shader)
     return program
 
+# --- ADD THIS CODE ---
+
+GENERIC_VERTEX_SRC = """#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aTex;
+uniform mat4 model, view, proj;
+out vec3 vWorld, vNormal;
+out vec2 vUV;
+void main(){
+    vWorld  = vec3(model * vec4(aPos,1));
+    vNormal = mat3(transpose(inverse(model))) * aNormal;
+    vUV     = aTex;
+    gl_Position = proj * view * vec4(vWorld,1);
+}"""
+
+GENERIC_FRAGMENT_SRC = """#version 330 core
+in vec3 vWorld, vNormal;
+in vec2 vUV;
+out vec4 FragCol;
+uniform vec3 sunDir, sunCol, horizon, viewPos;
+uniform vec4 baseCol;
+uniform bool hasTex;
+uniform sampler2D tex;
+void main(){
+    if( baseCol.a < 0.01 ) discard;   // alpha-test – fully invisible
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(-sunDir);
+    vec3 V = normalize(viewPos - vWorld);
+    vec3 R = reflect(-L,N);
+
+    vec3 ambient = horizon * 0.4;
+    vec3 diffuse = sunCol * max(0.0, dot(N,L));
+    vec3 spec    = sunCol * pow(max(0.0, dot(V,R)), 32) * 0.3;
+
+    vec4 col = baseCol;
+    if(hasTex) col *= texture(tex, vUV);
+
+    FragCol = vec4(col.rgb * (ambient + diffuse + spec), col.a);
+}"""
+
 # --- Procedural Sky & Clouds GLSL Function Source ---
+# (Existing code follows)
 PROCEDURAL_SKY_CLOUDS_FUNC_SRC = """
 
 // --- UTILITY FUNCTIONS (Noise Generation) ---
@@ -469,6 +511,113 @@ vec3 getProceduralSkyAndCloudsColor(vec3 viewDirWorld, float currentTime, vec3 s
     finalColor += sunDisk;
 
     return finalColor;
+}
+"""
+
+# --- Terrain Shader Definitions ---
+TERRAIN_VERTEX_SHADER_SRC = """
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aTexCoords;
+layout (location = 3) in vec3 aBlendWeights;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+out vec3 v_WorldPos;
+out vec3 v_Normal;
+out vec2 v_TexCoords;
+out vec3 v_BlendWeights;
+
+void main() {
+    v_WorldPos = vec3(model * vec4(aPos, 1.0));
+    v_Normal = mat3(transpose(inverse(model))) * aNormal;
+    v_TexCoords = aTexCoords;
+    v_BlendWeights = aBlendWeights;
+    gl_Position = projection * view * vec4(v_WorldPos, 1.0);
+}
+"""
+
+TERRAIN_FRAGMENT_SHADER_SRC = """
+#version 330 core
+out vec4 FragColor;
+
+in vec3 v_WorldPos;
+in vec3 v_Normal;
+in vec2 v_TexCoords;
+in vec3 v_BlendWeights;
+
+// --- Texture Samplers ---
+uniform sampler2D texture_slot0;
+uniform sampler2D texture_slot1;
+uniform sampler2D texture_slot2;
+
+// --- Texture availability flags ---
+uniform bool has_texture_slot0;
+uniform bool has_texture_slot1;
+uniform bool has_texture_slot2;
+
+// --- Fallback colors ---
+uniform vec4 color_slot0;
+uniform vec4 color_slot1;
+uniform vec4 color_slot2;
+
+// --- Lighting & Environment Uniforms ---
+uniform vec3 sunDirection_World;
+uniform vec3 sunColor;         // NEW: Dynamic color of the sun
+uniform vec3 horizonColor;     // NEW: Color of the sky at the horizon for ambient/fog
+uniform vec3 viewPos;
+
+// --- Fog Uniforms ---
+uniform float fogDensity;      // NEW: Controls how thick the fog is
+uniform float fogGradient;     // NEW: Controls how sharply the fog appears with distance
+
+const float TILING_FACTOR = 25.0;
+
+void main() {
+    // --- 1. Sample and Blend Textures ---
+    vec4 tex_color_0 = has_texture_slot0 ? texture(texture_slot0, v_TexCoords * TILING_FACTOR) : color_slot0;
+    vec4 tex_color_1 = has_texture_slot1 ? texture(texture_slot1, v_TexCoords * TILING_FACTOR) : color_slot1;
+    vec4 tex_color_2 = has_texture_slot2 ? texture(texture_slot2, v_TexCoords * TILING_FACTOR) : color_slot2;
+
+    vec4 blended_color = tex_color_0 * v_BlendWeights.x +
+                         tex_color_1 * v_BlendWeights.y +
+                         tex_color_2 * v_BlendWeights.z;
+
+    // --- 2. Dynamic Lighting influenced by the Sky ---
+    vec3 norm = normalize(v_Normal);
+    vec3 lightDir = normalize(-sunDirection_World);
+
+    // Ambient light is now the sky's horizon color, creating a natural atmospheric fill light.
+    float ambientStrength = 0.4;
+    vec3 ambient = ambientStrength * horizonColor;
+
+    // Diffuse light uses the dynamic sun color, matching the sunset.
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 diffuse = diff * sunColor;
+
+    // Specular lighting also uses the sun's color.
+    float specularStrength = 0.3;
+    vec3 viewDir = normalize(viewPos - v_WorldPos);
+    vec3 reflectDir = reflect(-lightDir, norm);
+    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
+    vec3 specular = specularStrength * spec * sunColor;
+
+    vec3 final_lighting = ambient + diffuse + specular;
+    vec3 lit_color = final_lighting * blended_color.rgb;
+
+    // --- 3. Atmospheric Distance Fog ---
+    // The fog fades the terrain to the sky's horizon color based on distance from the camera.
+    float distance_from_cam = length(viewPos - v_WorldPos);
+    float fogFactor = exp(-pow(distance_from_cam * fogDensity, fogGradient));
+    fogFactor = clamp(fogFactor, 0.0, 1.0);
+
+    // Blend the lit terrain color with the fog color (horizon color).
+    vec3 final_color = mix(horizonColor, lit_color, fogFactor);
+
+    FragColor = vec4(final_color, blended_color.a);
 }
 """
 
@@ -726,6 +875,36 @@ class CubeOpenGLFrame(OpenGLFrame):
             self.brush_visualizer = None
             self.brush_shader = None
 
+        # Initialize terrain shader for multi-texture painting
+        try:
+            self.terrain_shader = create_shader_program(TERRAIN_VERTEX_SHADER_SRC, TERRAIN_FRAGMENT_SHADER_SRC)
+            self.terrain_textures = {}  # Dictionary to store terrain texture IDs
+            print("Terrain shader initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to initialize terrain shader: {e}")
+            self.terrain_shader = None
+            self.terrain_textures = {}
+
+        try:
+            self.generic_mesh_shader = create_shader_program(GENERIC_VERTEX_SRC, GENERIC_FRAGMENT_SRC)
+            self._generic_mesh_locs = {
+                'model'   : glGetUniformLocation(self.generic_mesh_shader, "model"),
+                'view'    : glGetUniformLocation(self.generic_mesh_shader, "view"),
+                'proj'    : glGetUniformLocation(self.generic_mesh_shader, "proj"),
+                'sunDir'  : glGetUniformLocation(self.generic_mesh_shader, "sunDir"),
+                'sunCol'  : glGetUniformLocation(self.generic_mesh_shader, "sunCol"),
+                'horizon' : glGetUniformLocation(self.generic_mesh_shader, "horizon"),
+                'viewPos' : glGetUniformLocation(self.generic_mesh_shader, "viewPos"),
+                'baseCol' : glGetUniformLocation(self.generic_mesh_shader, "baseCol"),
+                'hasTex'  : glGetUniformLocation(self.generic_mesh_shader, "hasTex"),
+                'tex'     : glGetUniformLocation(self.generic_mesh_shader, "tex")
+            }
+            print("Generic mesh shader initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to initialize generic mesh shader: {e}")
+            self.generic_mesh_shader = None
+            self._generic_mesh_locs = {}
+
     def _setup_fxaa(self):
         """Setup FXAA (Fast Approximate Anti-Aliasing) using framebuffer objects and post-processing."""
         try:
@@ -927,8 +1106,8 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Enhanced fog for depth (from TheHigh V1)
         glEnable(GL_FOG)
         glFogi(GL_FOG_MODE, GL_EXP2)
-        # Use dynamic fog color from app
-        fog_color = self.app.get_current_fog_color()
+        # Use sky color as fog color
+        fog_color = self.app.sky_color
         glFogfv(GL_FOG_COLOR, fog_color)
         glFogf(GL_FOG_DENSITY, 0.01)  # Subtle fog
         glFogf(GL_FOG_START, 10.0)
@@ -1512,7 +1691,7 @@ class CubeOpenGLFrame(OpenGLFrame):
     # -------------------------------------------------------------------
 
     def _handle_terrain_editing(self, ray_origin, ray_direction, event):
-        """Handle terrain sculpting when in terrain editing mode."""
+        """Handle terrain editing - sculpting or painting based on current mode."""
         if not self.current_terrain_obj:
             return
 
@@ -1521,15 +1700,27 @@ class CubeOpenGLFrame(OpenGLFrame):
         if intersection_point is None:
             return
 
-        # Determine if we're raising or lowering based on modifier keys
-        is_raising = True  # Default to raising
-        if hasattr(event, 'state'):
-            # Check for Shift key (lower terrain)
-            if event.state & 0x1:  # Shift key
-                is_raising = False
+        # Get current terrain tool mode
+        current_mode = getattr(self.app, 'terrain_tool_mode_var', None)
+        if current_mode is None:
+            return
 
-        # Apply terrain modification
-        self._modify_terrain_at_point(intersection_point, is_raising)
+        mode = current_mode.get()
+
+        # Handle different modes
+        if mode == "Paint":
+            # PAINT MODE: Paint terrain, Shift+click removes paint
+            is_removing = False
+            if hasattr(event, 'state') and (event.state & 0x1):  # Shift key
+                is_removing = True
+            self._paint_terrain_at_point(intersection_point, is_removing)
+
+        elif mode in ["Sculpt", "Smooth"]:
+            # SCULPT MODE: Sculpt terrain, Shift+click lowers
+            is_raising = True
+            if hasattr(event, 'state') and (event.state & 0x1):  # Shift key
+                is_raising = False
+            self._modify_terrain_at_point(intersection_point, is_raising)
 
     def _modify_terrain_at_point(self, world_point, is_raising=True):
         """Modify terrain height at a specific world point using proper sculpting."""
@@ -1611,12 +1802,35 @@ class CubeOpenGLFrame(OpenGLFrame):
             return
 
         vertices = self.current_terrain_obj['vertices']
-        faces = self.current_terrain_obj['faces']
+        # This is a simplified normal calculation. For better results, a per-face
+        # normal calculation followed by averaging for each vertex is needed.
+        # However, for basic lighting this is sufficient.
+        temp_mesh = trimesh.Trimesh(vertices=vertices, faces=self.current_terrain_obj['faces'])
+        temp_mesh.fix_normals()
 
-        # Simple normal calculation - all pointing up for now
-        # For better results, calculate per-face normals and average
-        normals = np.tile([0, 1, 0], (len(vertices), 1)).astype(np.float32)
-        self.current_terrain_obj['normals'] = normals
+        self.current_terrain_obj['normals'] = np.array(temp_mesh.vertex_normals, dtype=np.float32)
+
+        # CRITICAL FIX: Update the geometry VBOs on the GPU
+        self._update_terrain_geometry_vbos(self.current_terrain_obj)
+
+    def _update_terrain_geometry_vbos(self, terrain_obj):
+        """Update terrain geometry VBOs after sculpting changes."""
+        if not terrain_obj or terrain_obj.get('VAO') is None:
+            return
+
+        try:
+            # Update vertex positions (VBO index 0)
+            glBindBuffer(GL_ARRAY_BUFFER, terrain_obj['VBOs'][0])
+            glBufferSubData(GL_ARRAY_BUFFER, 0, terrain_obj['vertices'].nbytes, terrain_obj['vertices'])
+
+            # Update normals (VBO index 1)
+            glBindBuffer(GL_ARRAY_BUFFER, terrain_obj['VBOs'][1])
+            glBufferSubData(GL_ARRAY_BUFFER, 0, terrain_obj['normals'].nbytes, terrain_obj['normals'])
+
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        except Exception as e:
+            print(f"Error updating terrain geometry VBOs: {e}")
 
     def set_terrain_editing_mode(self, enabled, terrain_obj=None):
         """Enable or disable terrain editing mode."""
@@ -1633,6 +1847,202 @@ class CubeOpenGLFrame(OpenGLFrame):
     def set_terrain_brush_strength(self, strength):
         """Set the terrain brush strength."""
         self.terrain_brush_strength = max(0.1, min(2.0, strength))
+
+    def set_terrain_texture(self, slot_index, pil_image):
+        """Set terrain texture for a specific slot."""
+        if not (0 <= slot_index < 3):
+            print(f"Invalid slot index: {slot_index}")
+            return
+
+        try:
+            # Clear existing texture if any
+            if slot_index in self.terrain_textures:
+                glDeleteTextures(1, [self.terrain_textures[slot_index]])
+                del self.terrain_textures[slot_index]
+
+            if pil_image is None:
+                print(f"Cleared texture for slot {slot_index + 1}")
+                return
+
+            # Convert PIL image to OpenGL texture
+            img_data = pil_image.convert("RGBA")
+            img_width, img_height = img_data.size
+            img_bytes = img_data.tobytes()
+
+            # Generate OpenGL texture
+            texture_id = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, texture_id)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img_width, img_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_bytes)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+            glBindTexture(GL_TEXTURE_2D, 0)
+
+            # Store texture ID for rendering
+            self.terrain_textures[slot_index] = texture_id
+
+            print(f"Loaded texture for slot {slot_index + 1}: {img_width}x{img_height}")
+
+        except Exception as e:
+            print(f"Error setting terrain texture: {e}")
+
+    def _setup_terrain_buffers(self, part):
+        """Creates VAO and VBOs for a terrain object for shader-based rendering."""
+        if part.get('VAO') is not None: # Buffers already created
+            glDeleteVertexArrays(1, [part['VAO']])
+            if part.get('VBOs'):
+                glDeleteBuffers(len(part['VBOs']), part['VBOs'])
+
+        terrain_props = part.get('terrain_properties', {})
+        if 'blend_weights' not in terrain_props:
+            return # Not a valid terrain object
+
+        VAO = glGenVertexArrays(1)
+        glBindVertexArray(VAO)
+
+        # 1. Vertex Buffer
+        VBO_verts = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, VBO_verts)
+        glBufferData(GL_ARRAY_BUFFER, part['vertices'].nbytes, part['vertices'], GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+        # 2. Normals Buffer
+        VBO_normals = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, VBO_normals)
+        glBufferData(GL_ARRAY_BUFFER, part['normals'].nbytes, part['normals'], GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(1)
+
+        # 3. TexCoords Buffer
+        VBO_texcoords = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, VBO_texcoords)
+        glBufferData(GL_ARRAY_BUFFER, part['texcoords'].nbytes, part['texcoords'], GL_STATIC_DRAW)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(2)
+
+        # 4. BlendWeights Buffer
+        VBO_blend_weights = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, VBO_blend_weights)
+        glBufferData(GL_ARRAY_BUFFER, terrain_props['blend_weights'].nbytes, terrain_props['blend_weights'], GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(3)
+
+        # 5. Index Buffer (EBO)
+        EBO = glGenBuffers(1)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, part['faces'].nbytes, part['faces'], GL_STATIC_DRAW)
+
+        # Unbind VAO
+        glBindVertexArray(0)
+
+        # Store buffer IDs in the part dictionary for later use
+        part['VAO'] = VAO
+        part['VBOs'] = [VBO_verts, VBO_normals, VBO_texcoords, VBO_blend_weights, EBO]
+        print(f"Initialized shader buffers for terrain: {part['name']}")
+
+    def _setup_mesh_buffers(self, part):
+        if part.get('VAO') is not None:
+            return
+        VAO = glGenVertexArrays(1)
+        glBindVertexArray(VAO)
+
+        # 1. vertices
+        vbo_v = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_v)
+        glBufferData(GL_ARRAY_BUFFER, part['vertices'].nbytes, part['vertices'], GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+        # 2. normals
+        vbo_n = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo_n)
+        glBufferData(GL_ARRAY_BUFFER, part['normals'].nbytes, part['normals'], GL_STATIC_DRAW)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(1)
+
+        vbo_t = None
+        # 3. texcoords (ONLY if they exist)
+        if part.get('texcoords') is not None:
+            vbo_t = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_t)
+            glBufferData(GL_ARRAY_BUFFER, part['texcoords'].nbytes, part['texcoords'], GL_STATIC_DRAW)
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, None)
+            glEnableVertexAttribArray(2)
+
+        # 4. indices
+        ebo = glGenBuffers(1)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, part['faces'].nbytes, part['faces'], GL_STATIC_DRAW)
+
+        glBindVertexArray(0)
+
+        part['VAO']  = VAO
+        part['VBOs'] = [vbo_v, vbo_n, vbo_t, ebo]
+
+    def _paint_terrain_at_point(self, world_point, is_removing=False):
+        if not self.current_terrain_obj or not self.current_terrain_obj.get('is_terrain', False):
+            return
+
+        terrain_props = self.current_terrain_obj.get('terrain_properties')
+        if not terrain_props or 'blend_weights' not in terrain_props:
+            return
+
+        vertices = self.current_terrain_obj['vertices']
+        blend_weights = terrain_props['blend_weights']
+        active_slot = self.app.active_texture_slot.get()
+
+        paint_strength = self.app.paint_strength_var.get()
+        radius = self.app.brush_size_var.get()
+        radius_sq = radius * radius
+        changed_weights = False
+
+        for i in range(vertices.shape[0]):
+            vx, vz = vertices[i, 0], vertices[i, 2]
+            dist_sq = (vx - world_point[0])**2 + (vz - world_point[2])**2
+            if dist_sq < radius_sq:
+                falloff = 1.0 - math.sqrt(dist_sq) / radius
+                paint_amount = paint_strength * falloff
+
+                current_weights = blend_weights[i]
+
+                if is_removing:
+                    current_weights[active_slot] -= paint_amount
+                else:
+                    current_weights[active_slot] += paint_amount
+
+                # Ensure weights don't go below 0
+                current_weights = np.maximum(current_weights, 0)
+
+                total_weight = np.sum(current_weights)
+                if total_weight > 1e-6:
+                    blend_weights[i] = current_weights / total_weight
+
+                changed_weights = True
+
+        if changed_weights:
+            self._update_terrain_blend_weights(self.current_terrain_obj)
+
+    def _update_terrain_blend_weights(self, terrain_obj):
+        """Update terrain VAO with new blend weights after painting."""
+        if not terrain_obj or terrain_obj.get('VAO') is None:
+            return
+
+        try:
+            terrain_props = terrain_obj.get('terrain_properties', {})
+            blend_weights = terrain_props.get('blend_weights')
+
+            if blend_weights is None:
+                return
+
+            # Update blend weights VBO (VBO index 3)
+            glBindBuffer(GL_ARRAY_BUFFER, terrain_obj['VBOs'][3])
+            glBufferSubData(GL_ARRAY_BUFFER, 0, blend_weights.nbytes, blend_weights)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        except Exception as e:
+            print(f"Error updating terrain blend weights: {e}")
 
     # -------------------------------------------------------------------
     # Model Loading and Processing
@@ -1821,37 +2231,43 @@ class CubeOpenGLFrame(OpenGLFrame):
     def _process_mesh_for_drawing(self, mesh_obj, world_transform, geom_name_hint="mesh_part"):
         if not hasattr(mesh_obj, 'vertices') or len(mesh_obj.vertices) == 0: return
 
-        if mesh_obj.faces.shape[1] == 4:
+        if hasattr(mesh_obj, 'faces') and mesh_obj.faces.shape[1] == 4:
             mesh_obj = mesh_obj.subdivide_to_size(max_edge=1e9)
 
-        if mesh_obj.faces.shape[1] != 3: return
+        if not hasattr(mesh_obj, 'faces') or mesh_obj.faces.shape[1] != 3: return
 
-        # Submit heavy mesh processing to thread pool
         future = self.thread_pool.submit(self._process_mesh_normals_threaded, mesh_obj)
-        mesh_obj = future.result()  # Wait for completion since we need the result immediately
+        mesh_obj = future.result()
 
-        texcoords, pil_image_ref, base_color_factor, vertex_colors_array, is_transparent_part = (None,)*5
-        base_color_factor = [0.8, 0.8, 0.8, 1.0]
+        texcoords, pil_image_ref, base_color_factor, is_transparent_part = None, None, [0.8, 0.8, 0.8, 1.0], False
+        material = None
 
-        if hasattr(mesh_obj, 'visual'):
-            visual = mesh_obj.visual
-            if hasattr(visual, 'material'):
-                material = visual.material
-                if hasattr(material, 'baseColorTexture') and isinstance(material.baseColorTexture, Image.Image):
-                    pil_image_ref = material.baseColorTexture
-                    img_id = id(pil_image_ref)
-                    if img_id not in self.pil_images_awaiting_gl_upload:
-                         self.pil_images_awaiting_gl_upload[img_id] = pil_image_ref
-                if hasattr(material, 'baseColorFactor'):
-                    bcf = material.baseColorFactor
-                    if bcf is not None:
-                        base_color_factor = [bcf[0], bcf[1], bcf[2], bcf[3] if len(bcf) > 3 else 1.0]
-        
-            if hasattr(visual, 'uv') and len(visual.uv) == len(mesh_obj.vertices):
-                texcoords = np.array(visual.uv, dtype=np.float32)
-        
-        # Decompose the initial transform matrix into T, R, S
+        if hasattr(mesh_obj, 'visual') and hasattr(mesh_obj.visual, 'material'):
+            material = mesh_obj.visual.material
+            if hasattr(material, 'baseColorTexture') and isinstance(material.baseColorTexture, Image.Image):
+                pil_image_ref = material.baseColorTexture
+                img_id = id(pil_image_ref)
+                if img_id not in self.pil_images_awaiting_gl_upload:
+                    self.pil_images_awaiting_gl_upload[img_id] = pil_image_ref
+            if hasattr(material, 'baseColorFactor'):
+                bcf = material.baseColorFactor
+                if bcf is not None:
+                    base_color_factor = [bcf[0], bcf[1], bcf[2], bcf[3] if len(bcf) > 3 else 1.0]
+
+        if hasattr(mesh_obj, 'visual') and hasattr(mesh_obj.visual, 'uv') and len(mesh_obj.visual.uv) == len(mesh_obj.vertices):
+            texcoords = np.array(mesh_obj.visual.uv, dtype=np.float32)
+
         scale, shear, angles, translate, perspective = trimesh.transformations.decompose_matrix(world_transform)
+
+        alpha_mode = getattr(material, 'alphaMode', None) if material else None
+        mat_name = (getattr(material, 'name', '') or '').lower() if material else ""
+
+        is_glass_like = ('glass' in mat_name) or (alpha_mode == 'BLEND')
+        if is_glass_like:
+            base_color_factor[3] = min(base_color_factor[3], 0.35)
+            is_transparent_part = True
+        else:
+            is_transparent_part = base_color_factor[3] < 0.99
 
         part_data = {
             'name': geom_name_hint,
@@ -1860,13 +2276,13 @@ class CubeOpenGLFrame(OpenGLFrame):
             'normals': np.array(mesh_obj.vertex_normals, dtype=np.float32),
             'texcoords': texcoords,
             'position': np.array(translate, dtype=np.float32),
-            'rotation': np.array(angles, dtype=np.float32), # Euler angles in radians
+            'rotation': np.array(angles, dtype=np.float32),
             'scale': np.array(scale, dtype=np.float32),
             'pil_image_ref': pil_image_ref,
             'base_color_factor': base_color_factor,
             'vertex_colors': None,
-            'is_transparent': base_color_factor[3] < 0.99,
-            'script_file': None  # Script file path (portable, relative)
+            'is_transparent': is_transparent_part,
+            'script_file': None
         }
         self.model_draw_list.append(part_data)
 
@@ -2034,14 +2450,15 @@ class CubeOpenGLFrame(OpenGLFrame):
                 self.app.color_r_slider.set(color[0])
                 self.app.color_g_slider.set(color[1])
                 self.app.color_b_slider.set(color[2])
+                # --- ADD THESE TWO LINES ---
+                self.app.color_a_slider.set(color[3])
+                self.app.color_a_label.configure(text=f"A: {int(color[3]*255)}")
+
                 self.app.color_r_label.configure(text=f"R: {int(color[0]*255)}")
                 self.app.color_g_label.configure(text=f"G: {int(color[1]*255)}")
                 self.app.color_b_label.configure(text=f"B: {int(color[2]*255)}")
 
-                # ---------- alpha ----------  <-- NEW
-                alpha = part['base_color_factor'][3]
-                self.app.alpha_slider.set(alpha)
-                self.app.alpha_label.configure(text=f"A: {int(alpha*255)}")
+
 
                 # --- Update Physics Properties ---
                 physics_type = part.get('physics_type', 'None')
@@ -2068,14 +2485,7 @@ class CubeOpenGLFrame(OpenGLFrame):
                 mass_value = part.get('mass', 1.0 if physics_type != 'None' else 0.0)
                 self.app.mass_var.set(f"{mass_value:.2f}")
 
-                # --- Update Script Properties ---
-                script_file = part.get('script_file', None)
-                if script_file:
-                    self.app.script_file_var.set(script_file)
-                    self.app.script_file_label.configure(text=script_file)
-                else:
-                    self.app.script_file_var.set("None")
-                    self.app.script_file_label.configure(text="None")
+
 
                 self.app.set_properties_state("normal")
             else:
@@ -2088,22 +2498,20 @@ class CubeOpenGLFrame(OpenGLFrame):
                 self.app.color_r_slider.set(0)
                 self.app.color_g_slider.set(0)
                 self.app.color_b_slider.set(0)
+                self.app.color_a_slider.set(1)
                 self.app.color_r_label.configure(text="R: -")
                 self.app.color_g_label.configure(text="G: -")
                 self.app.color_b_label.configure(text="B: -")
+                self.app.color_a_label.configure(text="A: -")
 
-                # Clear alpha slider  <-- NEW
-                self.app.alpha_slider.set(0)
-                self.app.alpha_label.configure(text="A: -")
+
 
                 # Clear physics properties
                 self.app.physics_type_var.set("None")
                 self.app.physics_shape_var.set("Cube")
                 self.app.mass_var.set("0.0")
 
-                # Clear script properties
-                self.app.script_file_var.set("None")
-                self.app.script_file_label.configure(text="None")
+
 
                 self.app.set_properties_state("disabled")
         finally:
@@ -2139,19 +2547,19 @@ class CubeOpenGLFrame(OpenGLFrame):
             r = self.app.color_r_slider.get()
             g = self.app.color_g_slider.get()
             b = self.app.color_b_slider.get()
-            part['base_color_factor'][0] = r
-            part['base_color_factor'][1] = g
-            part['base_color_factor'][2] = b
+            # --- ADD THESE THREE LINES ---
+            a = self.app.color_a_slider.get()
+            part['base_color_factor'] = [r, g, b, a]
+            part['is_transparent'] = a < 0.99 # Update transparency status
+
             # Update color labels
             self.app.color_r_label.configure(text=f"R: {int(r*255)}")
             self.app.color_g_label.configure(text=f"G: {int(g*255)}")
             self.app.color_b_label.configure(text=f"B: {int(b*255)}")
+            # --- ADD THIS LINE ---
+            self.app.color_a_label.configure(text=f"A: {int(a*255)}")
 
-            # ---------- alpha ----------  <-- NEW
-            alpha = self.app.alpha_slider.get()
-            part['base_color_factor'][3] = alpha
-            part['is_transparent'] = alpha < 0.99  # Update transparency flag
-            self.app.alpha_label.configure(text=f"A: {int(alpha*255)}")
+
 
 
             # Update gizmo and redraw
@@ -2519,89 +2927,130 @@ class CubeOpenGLFrame(OpenGLFrame):
         glLightfv(GL_LIGHT2, GL_POSITION, [cam_right[0], cam_right[1], cam_right[2], 0.0])
         glLightfv(GL_LIGHT3, GL_POSITION, [-cam_right[0], -cam_right[1], -cam_right[2], 0.0])
 
-    def _draw_part_with_hbao(self, part):
-        """Draw part with high-quality rendering and HBAO ambient occlusion effect."""
-        if not (part['vertices'] is not None and part['faces'] is not None and \
+    def _draw_part_with_hbao(self, part, sun_direction_world, view_pos):
+        """Draw part with high-quality rendering, HBAO effect, and dedicated terrain shader path."""
+        if not (part.get('vertices') is not None and part.get('faces') is not None and \
                 len(part['vertices']) > 0 and len(part['faces']) > 0):
             return
 
-        glPushMatrix()
-        world_transform = self._recompose_transform(part)
-        glMultMatrixf(world_transform.T.flatten())
+        is_terrain = part.get('is_terrain', False)
 
-        # High-quality material properties (from TheHigh V1)
-        base_color = part['base_color_factor']
-        is_enemy = part.get('is_enemy', False)
+        if is_terrain and self.terrain_shader:
+            # --- TERRAIN SHADER RENDER PATH ---
+            if part.get('VAO') is None:
+                self._setup_terrain_buffers(part)
+                if part.get('VAO') is None: return
 
-        if is_enemy:
-            # Enhanced red material for enemies with strong specular
-            ambient_color = [0.2, 0.0, 0.0, 1.0]
-            diffuse_color = [1.0, 0.1, 0.1, 1.0]
-            specular_color = [1.0, 0.5, 0.5, 1.0]
-            shininess = 64.0
+            glUseProgram(self.terrain_shader)
+
+            # Cache uniform locations for performance
+            if not hasattr(self, '_terrain_shader_locs'):
+                self._terrain_shader_locs = {
+                    'model': glGetUniformLocation(self.terrain_shader, "model"),
+                    'view': glGetUniformLocation(self.terrain_shader, "view"),
+                    'projection': glGetUniformLocation(self.terrain_shader, "projection"),
+                    'sunDirection': glGetUniformLocation(self.terrain_shader, "sunDirection_World"),
+                    'viewPos': glGetUniformLocation(self.terrain_shader, "viewPos"),
+                    'tex0': glGetUniformLocation(self.terrain_shader, "texture_slot0"),
+                    'tex1': glGetUniformLocation(self.terrain_shader, "texture_slot1"),
+                    'tex2': glGetUniformLocation(self.terrain_shader, "texture_slot2"),
+                    'has_tex0': glGetUniformLocation(self.terrain_shader, "has_texture_slot0"),
+                    'has_tex1': glGetUniformLocation(self.terrain_shader, "has_texture_slot1"),
+                    'has_tex2': glGetUniformLocation(self.terrain_shader, "has_texture_slot2"),
+                    'color0': glGetUniformLocation(self.terrain_shader, "color_slot0"),
+                    'color1': glGetUniformLocation(self.terrain_shader, "color_slot1"),
+                    'color2': glGetUniformLocation(self.terrain_shader, "color_slot2"),
+                    # --- NEW UNIFORM LOCATIONS ---
+                    'sunColor': glGetUniformLocation(self.terrain_shader, "sunColor"),
+                    'horizonColor': glGetUniformLocation(self.terrain_shader, "horizonColor"),
+                    'fogDensity': glGetUniformLocation(self.terrain_shader, "fogDensity"),
+                    'fogGradient': glGetUniformLocation(self.terrain_shader, "fogGradient"),
+                }
+            locs = self._terrain_shader_locs
+
+            world_transform = self._recompose_transform(part)
+            # --- FIX 1: Transpose the row-major world_transform matrix for OpenGL ---
+            glUniformMatrix4fv(locs['model'], 1, GL_FALSE, world_transform.T)
+            glUniformMatrix4fv(locs['view'], 1, GL_FALSE, glGetFloatv(GL_MODELVIEW_MATRIX))
+            glUniformMatrix4fv(locs['projection'], 1, GL_FALSE, glGetFloatv(GL_PROJECTION_MATRIX))
+            glUniform3fv(locs['sunDirection'], 1, sun_direction_world)
+            glUniform3fv(locs['viewPos'], 1, view_pos)
+
+            # --- PASS NEW ENVIRONMENT UNIFORMS ---
+            # Get sun elevation to calculate sunset color mix
+            sun_elevation = sun_direction_world[1]
+            sunset_factor = np.clip((0.25 - sun_elevation) / 0.25, 0.0, 1.0)
+
+            # Calculate dynamic sun color (matches sunset in sky shader)
+            sunset_color = np.array([0.9, 0.5, 0.2])
+            base_sun_color = np.array(self.app.sun_color[:3])
+            dynamic_sun_color = base_sun_color * (1.0 - sunset_factor) + (sunset_color * 1.5) * sunset_factor
+            glUniform3fv(locs['sunColor'], 1, dynamic_sun_color)
+
+            # Pass horizon color for ambient light and fog
+            glUniform3fv(locs['horizonColor'], 1, self.app.horizon_color_val)
+
+            # Pass fog settings from the UI
+            glUniform1f(locs['fogDensity'], self.app.fog_density)
+            glUniform1f(locs['fogGradient'], self.app.fog_gradient)
+            # --- END OF NEW UNIFORMS ---
+
+            props = part.get('terrain_properties', {})
+            slot_colors = props.get('slot_colors', [[1,1,1,1]]*3)
+
+            for i in range(3):
+                glUniform4fv(locs[f'color{i}'], 1, slot_colors[i])
+
+                tex_id = self.terrain_textures.get(i)
+                if tex_id:
+                    glActiveTexture(GL_TEXTURE0 + i)
+                    glBindTexture(GL_TEXTURE_2D, tex_id)
+                    glUniform1i(locs[f'tex{i}'], i)
+                    glUniform1i(locs[f'has_tex{i}'], 1)
+                else:
+                    glUniform1i(locs[f'has_tex{i}'], 0)
+
+            glBindVertexArray(part['VAO'])
+            glDrawElements(GL_TRIANGLES, part['faces'].size, GL_UNSIGNED_INT, None)
+
+            glBindVertexArray(0)
+            glUseProgram(0)
+            glActiveTexture(GL_TEXTURE0)
+
         else:
-            # High-quality material for regular objects
-            ambient_color = [c * 0.1 for c in base_color[:3]] + [base_color[3]]  # Lower ambient for better contrast
-            diffuse_color = [c * 0.9 for c in base_color[:3]] + [base_color[3]]  # Higher diffuse
-            specular_color = [0.8, 0.8, 0.8, 1.0]  # Strong white specular highlights
-            shininess = 128.0  # Sharp, realistic highlights
+            # --- NEW: GENERIC MESH SHADER PATH ---
+            if part.get('VAO') is None:          # safety
+                self._setup_mesh_buffers(part)
 
-        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, ambient_color)
-        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, diffuse_color)
-        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, specular_color)
-        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, shininess)
+            glUseProgram(self.generic_mesh_shader)   # we create this below
+            loc = self._generic_mesh_locs            # cached uniforms
 
-        # Apply shadow calculation (from TheHigh V1)
-        shadow_factor = self._apply_shadow_calculation(part)
+            world = part.get('world_transform', self._recompose_transform(part))
+            # --- FIX 2: Transpose the row-major world matrix for OpenGL ---
+            glUniformMatrix4fv(loc['model'], 1, GL_FALSE, world.T)
+            glUniformMatrix4fv(loc['view'],  1, GL_FALSE, glGetFloatv(GL_MODELVIEW_MATRIX))
+            glUniformMatrix4fv(loc['proj'], 1, GL_FALSE, glGetFloatv(GL_PROJECTION_MATRIX))
 
-        # Apply color for visibility with shadow consideration
-        if is_enemy:
-            # Enemy color with shadow
-            red_intensity = 1.0 * shadow_factor
-            glColor4f(red_intensity, 0.1 * shadow_factor, 0.1 * shadow_factor, 1.0)
-        else:
-            # Original color with shadow
-            shadowed_color = [c * shadow_factor for c in base_color[:3]] + [base_color[3]]
-            glColor4f(*shadowed_color)
+            # lighting & colour
+            glUniform3fv(loc['sunDir'],  1, sun_direction_world)
+            glUniform3fv(loc['sunCol'],  1, self.app.sun_color[:3])
+            glUniform3fv(loc['horizon'], 1, self.app.horizon_color_val)
+            glUniform3fv(loc['viewPos'], 1, view_pos)
+            glUniform4fv(loc['baseCol'], 1, part['base_color_factor'])
 
-        gl_tex_id_to_bind = 0
-        if part['pil_image_ref'] is not None:
-            pil_img_id_for_part = id(part['pil_image_ref'])
-            gl_tex_id_to_bind = self.opengl_texture_map.get(pil_img_id_for_part, 0)
+            # texture
+            tex_id = self.opengl_texture_map.get(id(part.get('pil_image_ref')), 0)
+            glUniform1i(loc['hasTex'], 1 if tex_id else 0)
+            if tex_id:
+                glActiveTexture(GL_TEXTURE0)
+                glBindTexture(GL_TEXTURE_2D, tex_id)
+                glUniform1i(loc['tex'], 0)
 
-        has_texture = gl_tex_id_to_bind != 0 and part['texcoords'] is not None
-        has_vcolors = part['vertex_colors'] is not None
-
-        if has_texture:
-            glEnable(GL_TEXTURE_2D)
-            glBindTexture(GL_TEXTURE_2D, gl_tex_id_to_bind)
-            glEnableClientState(GL_TEXTURE_COORD_ARRAY)
-            glTexCoordPointer(2, GL_FLOAT, 0, part['texcoords'])
-        else:
-            glDisable(GL_TEXTURE_2D)
-            if has_vcolors:
-                glEnable(GL_COLOR_MATERIAL)
-                glEnableClientState(GL_COLOR_ARRAY)
-                glColorPointer(4, GL_FLOAT, 0, part['vertex_colors'])
-
-        glEnableClientState(GL_VERTEX_ARRAY)
-        glVertexPointer(3, GL_FLOAT, 0, part['vertices'])
-        if part['normals'] is not None:
-            glEnableClientState(GL_NORMAL_ARRAY)
-            glNormalPointer(GL_FLOAT, 0, part['normals'])
-
-        glDrawElements(GL_TRIANGLES, part['faces'].size, GL_UNSIGNED_INT, part['faces'].flatten())
-
-        glDisableClientState(GL_VERTEX_ARRAY)
-        if part['normals'] is not None: glDisableClientState(GL_NORMAL_ARRAY)
-        if has_texture:
-            glDisableClientState(GL_TEXTURE_COORD_ARRAY)
-            glBindTexture(GL_TEXTURE_2D, 0)
-            glDisable(GL_TEXTURE_2D)
-        if has_vcolors:
-            glDisableClientState(GL_COLOR_ARRAY)
-            glDisable(GL_COLOR_MATERIAL)
-        glPopMatrix()
+            # draw
+            glBindVertexArray(part['VAO'])
+            glDrawElements(GL_TRIANGLES, part['faces'].size, GL_UNSIGNED_INT, None)
+            glBindVertexArray(0)
+            glUseProgram(0)
 
     def _draw_selection_gizmo(self):
         if self.selected_part_index is None: return
@@ -2777,7 +3226,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # Update fog color every frame
-        fog_color = self.app.get_current_fog_color()
+        fog_color = self.app.sky_color
         glFogfv(GL_FOG_COLOR, fog_color)
 
         # Setup projection matrix
@@ -2796,36 +3245,24 @@ class CubeOpenGLFrame(OpenGLFrame):
                   self.camera_up[0], self.camera_up[1], self.camera_up[2])
         view_matrix_gl = glGetFloatv(GL_MODELVIEW_MATRIX)
 
+        sun_direction_world = np.array([0.8, 0.7, -0.6], dtype=np.float32)
+        norm = np.linalg.norm(sun_direction_world)
+        if norm > 1e-6:
+            sun_direction_world /= norm
+
         # Render sky with clouds if sky renderer is available
         if self.sky_renderer is not None:
             try:
-                # Submit matrix inversion to thread pool for heavy computation
-                matrix_future = self.thread_pool.submit(self._calculate_inverse_matrices, projection_matrix_gl, view_matrix_gl)
-
-                # Try to get result quickly, fall back to direct calculation if needed
-                try:
-                    inv_projection_matrix, inv_view_matrix = matrix_future.result(timeout=0.005)  # 5ms timeout
-                except:
-                    # Fall back to direct calculation
-                    inv_projection_matrix = np.linalg.inv(projection_matrix_gl)
-                    inv_view_matrix = np.linalg.inv(view_matrix_gl)
-
-                # Sun direction for lighting (same as used in lighting setup)
-                sun_direction_world = np.array([0.8, 0.7, -0.6], dtype=np.float32)
-                norm = np.linalg.norm(sun_direction_world)
-                if norm > 1e-6:
-                    sun_direction_world /= norm
-                else:
-                    sun_direction_world = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                inv_projection_matrix = np.linalg.inv(projection_matrix_gl)
+                inv_view_matrix = np.linalg.inv(view_matrix_gl)
 
                 # Render sky behind everything
                 glDepthMask(GL_FALSE)
 
-                # Convert sky color to zenith and horizon colors
-                # Use the sky color as the base and create a gradient
-                sky_base = self.app.sky_color[:3]  # Get RGB only
-                zenith_color = [c * 0.8 for c in sky_base]  # Darker at zenith
-                horizon_color = [min(1.0, c * 1.2) for c in sky_base]  # Brighter at horizon
+                sky_base = self.app.sky_color[:3]
+                zenith_color = [c * 0.8 for c in sky_base]
+                horizon_color = [min(1.0, c * 1.2) for c in sky_base]
+                self.app.horizon_color_val = horizon_color
 
                 self.sky_renderer.draw(
                     inv_projection_matrix,
@@ -2845,26 +3282,27 @@ class CubeOpenGLFrame(OpenGLFrame):
         if self.model_loaded and self.model_draw_list:
             glEnable(GL_LIGHTING)
             self._apply_hbao_lighting()
-            opaque_parts = [p for p in self.model_draw_list if not p['is_transparent']]
-            transparent_parts = [p for p in self.model_draw_list if p['is_transparent']]
 
-            glDisable(GL_BLEND); glDepthMask(GL_TRUE)
-            for part in opaque_parts: self._draw_part_with_hbao(part)
+            opaque_parts = [p for p in self.model_draw_list if not p.get('is_transparent', False)]
+            transparent_parts = [p for p in self.model_draw_list if p.get('is_transparent', False)]
+
+            glDisable(GL_BLEND)
+            glDepthMask(GL_TRUE)
+            for part in opaque_parts:
+                self._draw_part_with_hbao(part, sun_direction_world, self.camera_pos)
 
             if transparent_parts:
                 glEnable(GL_BLEND)
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
                 glDepthMask(GL_FALSE)
-                for part in transparent_parts: self._draw_part_with_hbao(part)
+                for part in transparent_parts:
+                    self._draw_part_with_hbao(part, sun_direction_world, self.camera_pos)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
 
-            glDepthMask(GL_TRUE)
-            glDisable(GL_BLEND)
-            
-        # Don't draw gizmos in FPS mode
         if self.fps_mouse_sensitivity is None:
             self._draw_selection_gizmo()
 
-        # Update and draw brush visualizer when in terrain editing mode
         if (self.terrain_editing_mode and self.current_terrain_obj and
             self.brush_visualizer and self.brush_shader):
             self._update_brush_position()
@@ -2939,7 +3377,7 @@ class CubeOpenGLFrame(OpenGLFrame):
         # Cleanup threading resources
         try:
             print("Shutting down thread pool...")
-            self.thread_pool.shutdown(wait=True, timeout=2.0)
+            self.thread_pool.shutdown(wait=True)
             print("Thread pool shutdown complete.")
         except Exception as e:
             print(f"Error shutting down thread pool: {e}")
@@ -2975,11 +3413,8 @@ class App(ctk.CTk):
         self.rotate_button.pack(side="left", padx=5)
 
         # Fog and Sky Color buttons
-        self.fog_color_button = ctk.CTkButton(top_frame, text="Fog Color", command=self.choose_fog_color, width=80)
-        self.fog_color_button.pack(side="left", padx=(20, 5))
-
         self.sky_color_button = ctk.CTkButton(top_frame, text="Sky Color", command=self.choose_sky_color, width=80)
-        self.sky_color_button.pack(side="left", padx=5)
+        self.sky_color_button.pack(side="left", padx=(20, 5))
 
         self.halo_color_button = ctk.CTkButton(top_frame, text="Halo Color", command=self.choose_halo_color, width=80)
         self.halo_color_button.pack(side="left", padx=5)
@@ -3043,9 +3478,10 @@ class App(ctk.CTk):
         self.sky_color = [0.6, 0.7, 0.9, 1.0]  # Beautiful sky color from TheHigh V1
         self.halo_color = [1.0, 0.9, 0.7, 0.15]  # Default halo color
 
-        # Fog color settings
-        self.fog_auto_color = True  # True for auto color, False for manual color
-        self.fog_manual_color = [0.6, 0.7, 0.9, 1.0]  # Manual fog color (default to sky color)
+        # ADD THESE THREE LINES:
+        self.horizon_color_val = [0.6, 0.7, 0.9] # For terrain shader
+        self.fog_density = 0.003
+        self.fog_gradient = 1.5
 
         # Physics system
         self.physics_enabled = False
@@ -3153,6 +3589,13 @@ class App(ctk.CTk):
             command=self.show_gameobject_menu, corner_radius=0
         )
         gameobject_menu_button.pack(side="left", padx=2, pady=2)
+
+        # Window Menu
+        window_menu_button = ctk.CTkButton(
+            menu_frame, text="Window", width=70, height=30,
+            command=self.show_window_menu, corner_radius=0
+        )
+        window_menu_button.pack(side="left", padx=2, pady=2)
 
         # Help Menu
         help_menu_button = ctk.CTkButton(
@@ -3363,6 +3806,196 @@ class App(ctk.CTk):
             self.gl_frame.focus_set()
             print(f"Selected object from hierarchy: {index}")
 
+    def show_window_menu(self):
+        """Shows the Window menu with options for various editor windows."""
+        window_menu = ctk.CTkToplevel(self)
+        window_menu.title("Window")
+        window_menu.geometry("220x100")
+        window_menu.resizable(False, False)
+
+        # Position menu appropriately
+        window_menu.geometry("+460+50")
+
+        window_menu.transient(self)
+        window_menu.lift()
+        window_menu.focus_set()
+        window_menu.attributes("-topmost", True)
+        window_menu.after(100, lambda: window_menu.attributes("-topmost", False))
+
+        # Environment Settings
+        env_button = ctk.CTkButton(window_menu, text="Environment Settings", command=self.open_environment_settings)
+        env_button.pack(pady=5, padx=10, fill="x")
+
+    def open_environment_settings(self):
+        """Opens a window to control fog and other environmental effects."""
+        env_window = ctk.CTkToplevel(self)
+        env_window.title("Environment Settings")
+        env_window.geometry("350x200")
+        env_window.resizable(False, False)
+        env_window.geometry("+500+200")
+
+        env_window.transient(self)
+        env_window.lift()
+        env_window.focus_set()
+
+        title_label = ctk.CTkLabel(env_window, text="Atmospheric Fog", font=ctk.CTkFont(size=14, weight="bold"))
+        title_label.pack(pady=(10, 15))
+
+        # Fog Density Slider
+        ctk.CTkLabel(env_window, text="Fog Density").pack(padx=20, anchor="w")
+        density_slider = ctk.CTkSlider(env_window, from_=0.0, to=0.01, number_of_steps=100,
+                                       command=lambda v: setattr(self, 'fog_density', v))
+        density_slider.set(self.fog_density)
+        density_slider.pack(pady=(0, 10), padx=20, fill="x")
+
+        # Fog Gradient Slider
+        ctk.CTkLabel(env_window, text="Fog Gradient").pack(padx=20, anchor="w")
+        gradient_slider = ctk.CTkSlider(env_window, from_=0.5, to=5.0, number_of_steps=90,
+                                        command=lambda v: setattr(self, 'fog_gradient', v))
+        gradient_slider.set(self.fog_gradient)
+        gradient_slider.pack(pady=(0, 10), padx=20, fill="x")
+
+    def _on_paint_mode_change(self, slot_index, new_mode):
+        """Callback to handle UI changes when switching between Color/Texture mode."""
+        if self.gl_frame.selected_part_index is None: return
+        selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+        if not self._is_terrain_object(selected_obj): return
+
+        terrain_props = selected_obj.get('terrain_properties')
+        if not terrain_props: return
+
+        # --- 1. Update the data model ---
+        if 'slot_modes' not in terrain_props:
+            terrain_props['slot_modes'] = ['color', 'color', 'color']
+        terrain_props['slot_modes'][slot_index] = new_mode.lower()
+
+        # If switching back to color mode, ensure the texture is cleared
+        if new_mode == "Color":
+            terrain_props['texture_files'][slot_index] = None
+            # This call clears the actual texture from the GPU
+            self.gl_frame.set_terrain_texture(slot_index, None)
+
+        print(f"Set layer {slot_index + 1} to {new_mode} mode.")
+
+        # --- 2. Refresh the entire UI from the data model ---
+        # This ensures the button states are always correct based on the current mode.
+        self._update_terrain_editor_ui(selected_obj)
+
+    def _update_terrain_editor_ui(self, terrain_obj):
+        """Updates the terrain editor UI to reflect the properties of the selected terrain."""
+        if not hasattr(self, 'paint_mode_buttons') or not terrain_obj:
+            return
+
+        props = terrain_obj.get('terrain_properties', {})
+        slot_modes = props.get('slot_modes', ['color', 'color', 'color'])
+        texture_files = props.get('texture_files', [None, None, None])
+
+        for i in range(3):
+            mode = slot_modes[i]
+            self.paint_mode_buttons[i].set(mode.capitalize())
+
+            if mode == 'color':
+                self.color_buttons[i].configure(state="normal")
+                self.texture_buttons[i].configure(state="disabled")
+            else: # texture
+                self.color_buttons[i].configure(state="disabled")
+                self.texture_buttons[i].configure(state="normal")
+
+            # Update texture file label
+            if texture_files[i]:
+                self.texture_file_labels[i].configure(text=os.path.basename(texture_files[i]))
+            else:
+                self.texture_file_labels[i].configure(text="No Texture Loaded")
+
+    def choose_terrain_slot_color(self, slot_index):
+        import tkinter.colorchooser as colorchooser
+
+        if not (0 <= slot_index < 3): return
+
+        selected_obj = None
+        if self.gl_frame.selected_part_index is not None:
+            selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+
+        if not selected_obj or not selected_obj.get('is_terrain'):
+            print("Please select a terrain object before setting colors.")
+            return
+
+        terrain_props = selected_obj.get('terrain_properties')
+        if not terrain_props: return
+
+        initial_color = tuple(int(c * 255) for c in terrain_props['slot_colors'][slot_index][:3])
+        color_choice = colorchooser.askcolor(color=initial_color, title=f"Choose Color for Slot {slot_index + 1}")
+
+        if color_choice and color_choice[0]:
+            new_color_rgb = [c / 255.0 for c in color_choice[0]]
+            terrain_props['slot_colors'][slot_index] = new_color_rgb + [1.0] # Add alpha
+            print(f"Set color for slot {slot_index + 1} to {terrain_props['slot_colors'][slot_index]}")
+
+    def update_smooth_strength(self, value):
+        """Update terrain smooth strength."""
+        strength = float(value)
+        # No direct setting on gl_frame needed, value is read on use
+        self.smooth_strength_value_label.configure(text=f"{strength:.2f}")
+
+    def update_paint_strength(self, value):
+        """Update terrain paint strength."""
+        strength = float(value)
+        self.paint_strength_value_label.configure(text=f"{strength:.2f}")
+
+    def load_terrain_texture(self, slot_index):
+        if not (0 <= slot_index < 3): return
+
+        selected_obj = None
+        if self.gl_frame.selected_part_index is not None:
+            selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+
+        if not selected_obj or not selected_obj.get('is_terrain'):
+            print("Please select a terrain object before loading textures.")
+            return
+
+        filepath = filedialog.askopenfilename(
+            title=f"Select Texture for Slot {slot_index + 1}",
+            filetypes=(("Image Files", "*.png;*.jpg;*.jpeg"), ("All files", "*.*"))
+        )
+        if filepath:
+            terrain_props = selected_obj.get('terrain_properties')
+            if not terrain_props: return
+
+            # Initialize missing keys if they don't exist
+            if 'texture_files' not in terrain_props:
+                terrain_props['texture_files'] = [None, None, None]
+            if 'slot_colors' not in terrain_props:
+                terrain_props['slot_colors'] = [[0.2, 0.6, 0.2, 1.0], [0.5, 0.5, 0.5, 1.0], [0.6, 0.4, 0.2, 1.0]]
+            if 'slot_modes' not in terrain_props:
+                terrain_props['slot_modes'] = ['color', 'color', 'color']
+            if 'blend_weights' not in terrain_props:
+                num_vertices = selected_obj['vertices'].shape[0]
+                blend_weights = np.zeros((num_vertices, 3), dtype=np.float32)
+                blend_weights[:, 0] = 1.0
+                terrain_props['blend_weights'] = blend_weights
+
+            try:
+                # Store the filepath for saving the scene
+                terrain_props['texture_files'][slot_index] = filepath
+                filename = os.path.basename(filepath)
+                self.texture_file_labels[slot_index].configure(text=filename)
+
+                # Load the image using PIL
+                with Image.open(filepath) as pil_image:
+                    # Pass the PIL image object to the GL frame to create the texture
+                    self.gl_frame.set_terrain_texture(slot_index, pil_image)
+
+                print(f"Loaded texture for slot {slot_index + 1} from {filepath}")
+
+            except Exception as e:
+                print(f"Error loading texture file: {e}")
+                # If loading fails, clear the texture reference
+                if 'texture_files' in terrain_props:
+                    terrain_props['texture_files'][slot_index] = None
+                self.gl_frame.set_terrain_texture(slot_index, None)
+                if hasattr(self, 'texture_file_labels') and slot_index < len(self.texture_file_labels):
+                    self.texture_file_labels[slot_index].configure(text="Load Failed")
+
     def choose_sun_color(self):
         """Opens color picker for sun color."""
         if not self.sun_visible:
@@ -3416,116 +4049,7 @@ class App(ctk.CTk):
             self.halo_color = [c/255.0 for c in color[0]] + [self.halo_color[3]]  # Keep alpha
             print(f"Halo color changed to: {self.halo_color}")
 
-    def choose_fog_color(self):
-        """Opens fog color selection popup with auto/manual options."""
-        fog_popup = ctk.CTkToplevel(self)
-        fog_popup.title("Fog Color Settings")
-        fog_popup.geometry("300x200")
-        fog_popup.resizable(False, False)
 
-        # Make popup appear in front
-        fog_popup.transient(self)
-        fog_popup.grab_set()
-        fog_popup.lift()
-        fog_popup.focus_set()
-
-        # Center the popup
-        fog_popup.update_idletasks()
-        x = (fog_popup.winfo_screenwidth() // 2) - (300 // 2)
-        y = (fog_popup.winfo_screenheight() // 2) - (200 // 2)
-        fog_popup.geometry(f"300x200+{x}+{y}")
-
-        # Main frame
-        main_frame = ctk.CTkFrame(fog_popup)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # Title
-        title_label = ctk.CTkLabel(main_frame, text="Fog Color Options", font=ctk.CTkFont(size=16, weight="bold"))
-        title_label.pack(pady=(10, 20))
-
-        # Radio button variable
-        fog_mode_var = ctk.StringVar(value="auto" if self.fog_auto_color else "manual")
-
-        # Color picker button (defined early to be used in the command)
-        color_button = ctk.CTkButton(main_frame, text="Pick Color",
-                                    command=lambda: self.pick_fog_color(fog_popup, fog_mode_var))
-
-        # --- FIX: New function to update state immediately ---
-        def _update_fog_mode():
-            # Get the value from the UI variable
-            is_auto = (fog_mode_var.get() == "auto")
-
-            # 1. Update the main application state directly
-            self.fog_auto_color = is_auto
-
-            # 2. Update the color picker button's state
-            color_button.configure(state="disabled" if is_auto else "normal")
-
-            # 3. Print status and redraw to apply changes visually
-            print(f"Fog color mode set to: {'Auto' if self.fog_auto_color else 'Manual'}")
-            # Rendering will be handled by animate_task automatically
-
-        # Auto color radio button
-        auto_radio = ctk.CTkRadioButton(main_frame, text="Auto Color (similar to sky)",
-                                       variable=fog_mode_var, value="auto", command=_update_fog_mode)
-        auto_radio.pack(pady=5, anchor="w")
-
-        # Manual color radio button
-        manual_radio = ctk.CTkRadioButton(main_frame, text="Choose Color",
-                                         variable=fog_mode_var, value="manual", command=_update_fog_mode)
-        manual_radio.pack(pady=5, anchor="w")
-
-        # Now pack the color button and set its initial state
-        color_button.pack(pady=10)
-        color_button.configure(state="disabled" if self.fog_auto_color else "normal")
-
-        # OK and Cancel buttons
-        button_frame = ctk.CTkFrame(main_frame)
-        button_frame.pack(pady=(10, 0), fill="x")
-
-        def apply_fog_settings():
-            # State is already updated by radio buttons, just close the window
-            fog_popup.destroy()
-
-        def cancel_fog_settings():
-            fog_popup.destroy()
-
-        ok_button = ctk.CTkButton(button_frame, text="OK", command=apply_fog_settings)
-        ok_button.pack(side="left", padx=(0, 5), expand=True, fill="x")
-
-        cancel_button = ctk.CTkButton(button_frame, text="Cancel", command=cancel_fog_settings)
-        cancel_button.pack(side="right", padx=(5, 0), expand=True, fill="x")
-
-    def pick_fog_color(self, parent_popup, fog_mode_var):
-        """Opens color picker for manual fog color selection."""
-        import tkinter.colorchooser as colorchooser
-
-        # Convert current manual fog color to hex for color picker
-        current_rgb = tuple(int(c * 255) for c in self.fog_manual_color[:3])
-        current_hex = f"#{current_rgb[0]:02x}{current_rgb[1]:02x}{current_rgb[2]:02x}"
-
-        color = colorchooser.askcolor(color=current_hex, title="Choose Fog Color")
-        if color[0]:  # If user didn't cancel
-            # Convert RGB (0-255) to float (0-1)
-            self.fog_manual_color = [c/255.0 for c in color[0]] + [1.0]  # Add alpha
-            print(f"Manual fog color changed to: {self.fog_manual_color}")
-
-            # --- BUG FIX ---
-            # Set mode to manual and update the UI to reflect the change immediately.
-            self.fog_auto_color = False
-            fog_mode_var.set("manual")
-
-            # Trigger a redraw to apply the new fog color immediately
-            # Rendering will be handled by animate_task automatically
-
-    def get_current_fog_color(self):
-        """Returns the current fog color based on auto/manual setting."""
-        if self.fog_auto_color:
-            # Use sky color for auto fog
-            return self.sky_color
-        else:
-            # Use manually selected fog color
-            return self.fog_manual_color
 
     def toggle_sun_visibility(self):
         """Toggle sun and halo visibility and update button states."""
@@ -3725,25 +4249,20 @@ class App(ctk.CTk):
             traceback.print_exc()
 
     def open_terrain_editor(self):
-        """Opens terrain editor window with creation and sculpting tools."""
+        """Opens a tabbed terrain editor window with creation, sculpting, and painting tools."""
         terrain_window = ctk.CTkToplevel(self)
         terrain_window.title("Terrain Editor")
-        terrain_window.geometry("350x535")
+        terrain_window.geometry("500x700")
         terrain_window.resizable(False, False)
-
-        # Position window
         terrain_window.geometry("+400+200")
 
-        # Bring window to front
-        terrain_window.transient(self)  # Make it a transient window of the main window
-        terrain_window.lift()           # Bring to front
-        terrain_window.focus_set()      # Give focus to the window
-        terrain_window.attributes("-topmost", True)  # Keep on top initially
-        terrain_window.after(100, lambda: terrain_window.attributes("-topmost", False))  # Remove topmost after showing
+        terrain_window.transient(self)
+        terrain_window.lift()
+        terrain_window.focus_set()
+        terrain_window.attributes("-topmost", True)
+        terrain_window.after(100, lambda: terrain_window.attributes("-topmost", False))
 
-        # Handle window closing - turn off terrain editing mode when window is closed
         def on_terrain_window_close():
-            # Turn off terrain editing mode if it's enabled
             if hasattr(self, 'terrain_editing_var') and self.terrain_editing_var.get():
                 self.terrain_editing_var.set(False)
                 self.gl_frame.set_terrain_editing_mode(False)
@@ -3752,129 +4271,148 @@ class App(ctk.CTk):
 
         terrain_window.protocol("WM_DELETE_WINDOW", on_terrain_window_close)
 
-        # Title label
         title_label = ctk.CTkLabel(terrain_window, text="Terrain Editor", font=ctk.CTkFont(size=16, weight="bold"))
-        title_label.pack(pady=10)
+        title_label.pack(pady=(10, 5))
 
-        # --- TERRAIN CREATION SECTION ---
-        creation_frame = ctk.CTkFrame(terrain_window)
-        creation_frame.pack(pady=10, padx=20, fill="x")
-
-        creation_title = ctk.CTkLabel(creation_frame, text="Create New Terrain", font=ctk.CTkFont(size=14, weight="bold"))
-        creation_title.pack(pady=5)
-
-        # Size controls frame
-        size_frame = ctk.CTkFrame(creation_frame)
-        size_frame.pack(pady=5, padx=10, fill="x")
-
-        # X size control
-        x_label = ctk.CTkLabel(size_frame, text="X Size (km):")
-        x_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
-
-        self.terrain_x_var = ctk.StringVar(value="1.0")
-        x_entry = ctk.CTkEntry(size_frame, textvariable=self.terrain_x_var, width=80)
-        x_entry.grid(row=0, column=1, padx=10, pady=5)
-
-        # Y size control
-        y_label = ctk.CTkLabel(size_frame, text="Y Size (km):")
-        y_label.grid(row=1, column=0, padx=10, pady=5, sticky="w")
-
-        self.terrain_y_var = ctk.StringVar(value="1.0")
-        y_entry = ctk.CTkEntry(size_frame, textvariable=self.terrain_y_var, width=80)
-        y_entry.grid(row=1, column=1, padx=10, pady=5)
-
-        # Color picker for terrain
-        color_label = ctk.CTkLabel(size_frame, text="Ground Color:")
-        color_label.grid(row=2, column=0, padx=10, pady=5, sticky="w")
-
-        self.terrain_color = [0.4, 0.6, 0.3, 1.0]  # Default green
-        self.terrain_color_button = ctk.CTkButton(size_frame, text="Choose Color",
-                                                command=self.choose_terrain_color, width=80)
-        self.terrain_color_button.grid(row=2, column=1, padx=10, pady=5)
-
-        # Create button
-        create_button = ctk.CTkButton(creation_frame, text="Create Terrain",
-                                    command=lambda: self.create_terrain_plane(terrain_window))
-        create_button.pack(pady=10)
-
-        # --- TERRAIN SCULPTING SECTION ---
-        sculpting_frame = ctk.CTkFrame(terrain_window)
-        sculpting_frame.pack(pady=10, padx=20, fill="x")
-
-        sculpting_title = ctk.CTkLabel(sculpting_frame, text="Terrain Sculpting Tools", font=ctk.CTkFont(size=14, weight="bold"))
-        sculpting_title.pack(pady=5)
-
-        # Terrain editing mode toggle
         self.terrain_editing_var = ctk.BooleanVar()
-        editing_checkbox = ctk.CTkCheckBox(sculpting_frame, text="Enable Terrain Editing Mode",
+        editing_checkbox = ctk.CTkCheckBox(terrain_window, text="Enable Editing on Selected Terrain",
                                          variable=self.terrain_editing_var,
                                          command=self.toggle_terrain_editing)
-        editing_checkbox.pack(pady=5)
+        editing_checkbox.pack(pady=10, padx=20, fill="x")
 
-        # Brush controls frame
-        brush_frame = ctk.CTkFrame(sculpting_frame)
-        brush_frame.pack(pady=5, padx=10, fill="x")
+        tab_view = ctk.CTkTabview(terrain_window, width=380)
+        tab_view.pack(pady=10, padx=20, fill="both", expand=True)
 
-        # Brush size control
-        brush_size_label = ctk.CTkLabel(brush_frame, text="Brush Size:")
-        brush_size_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        create_tab = tab_view.add("Create")
+        sculpt_tab = tab_view.add("Sculpt")
+        paint_tab = tab_view.add("Paint")
 
+        self.terrain_tool_mode_var = ctk.StringVar(value="Sculpt")
+        sculpt_sub_mode_var = ctk.StringVar(value="Sculpt")
+
+        def on_tab_changed():
+            current_tab = tab_view.get()
+            if current_tab == "Sculpt":
+                self.terrain_tool_mode_var.set(sculpt_sub_mode_var.get())
+            elif current_tab == "Paint":
+                self.terrain_tool_mode_var.set("Paint")
+            print(f"Terrain tool mode changed to: {self.terrain_tool_mode_var.get()}")
+
+        tab_view.configure(command=on_tab_changed)
+
+        # --- 1. CREATE TAB ---
+        size_frame = ctk.CTkFrame(create_tab)
+        size_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(size_frame, text="X Size (km):").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.terrain_x_var = ctk.StringVar(value="1.0")
+        ctk.CTkEntry(size_frame, textvariable=self.terrain_x_var, width=100).grid(row=0, column=1, padx=10, pady=5)
+        ctk.CTkLabel(size_frame, text="Y Size (km):").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.terrain_y_var = ctk.StringVar(value="1.0")
+        ctk.CTkEntry(size_frame, textvariable=self.terrain_y_var, width=100).grid(row=1, column=1, padx=10, pady=5)
+        ctk.CTkLabel(size_frame, text="Base Color:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        self.terrain_color = [0.4, 0.6, 0.3, 1.0]
+        self.terrain_color_button = ctk.CTkButton(size_frame, text="Choose Color", command=self.choose_terrain_color)
+        self.terrain_color_button.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
+        create_button = ctk.CTkButton(create_tab, text="Create New Terrain", command=lambda: self.create_terrain_plane(terrain_window))
+        create_button.pack(pady=20, padx=10, fill="x")
+
+        # --- 2. SCULPT TAB ---
+        sculpting_frame = ctk.CTkFrame(sculpt_tab, fg_color="transparent")
+        sculpting_frame.pack(pady=5, padx=5, fill="both", expand=True)
+        tool_mode_button = ctk.CTkSegmentedButton(sculpting_frame, values=["Sculpt", "Smooth"], variable=sculpt_sub_mode_var, command=self.terrain_tool_mode_var.set)
+        tool_mode_button.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(sculpting_frame, text="Brush Size:").pack(padx=10, pady=(10, 0), anchor="w")
         self.brush_size_var = ctk.DoubleVar(value=25.0)
-        brush_size_slider = ctk.CTkSlider(brush_frame, from_=5.0, to=100.0,
-                                        variable=self.brush_size_var,
-                                        command=self.update_brush_size)
-        brush_size_slider.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-        brush_size_value = ctk.CTkLabel(brush_frame, text="25.0")
-        brush_size_value.grid(row=0, column=2, padx=5, pady=5)
-        self.brush_size_value_label = brush_size_value
-
-        # Brush strength control
-        brush_strength_label = ctk.CTkLabel(brush_frame, text="Brush Strength:")
-        brush_strength_label.grid(row=1, column=0, padx=10, pady=5, sticky="w")
-
+        ctk.CTkSlider(sculpting_frame, from_=5.0, to=100.0, variable=self.brush_size_var, command=self.update_brush_size).pack(padx=10, fill="x")
+        self.brush_size_value_label = ctk.CTkLabel(sculpting_frame, text="25.0")
+        self.brush_size_value_label.pack(padx=10, anchor="e")
+        ctk.CTkLabel(sculpting_frame, text="Sculpt Strength:").pack(padx=10, pady=(10, 0), anchor="w")
         self.brush_strength_var = ctk.DoubleVar(value=0.5)
-        brush_strength_slider = ctk.CTkSlider(brush_frame, from_=0.1, to=2.0,
-                                            variable=self.brush_strength_var,
-                                            command=self.update_brush_strength)
-        brush_strength_slider.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+        ctk.CTkSlider(sculpting_frame, from_=0.1, to=2.0, variable=self.brush_strength_var, command=self.update_brush_strength).pack(padx=10, fill="x")
+        self.brush_strength_value_label = ctk.CTkLabel(sculpting_frame, text="0.5")
+        self.brush_strength_value_label.pack(padx=10, anchor="e")
+        ctk.CTkLabel(sculpting_frame, text="Smooth Strength:").pack(padx=10, pady=(10, 0), anchor="w")
+        self.smooth_strength_var = ctk.DoubleVar(value=0.1)
+        ctk.CTkSlider(sculpting_frame, from_=0.01, to=1.0, variable=self.smooth_strength_var, command=self.update_smooth_strength).pack(padx=10, fill="x")
+        self.smooth_strength_value_label = ctk.CTkLabel(sculpting_frame, text="0.10")
+        self.smooth_strength_value_label.pack(padx=10, anchor="e")
+        instructions = "Left-click to raise terrain.\nShift + Left-click to lower."
+        ctk.CTkLabel(sculpting_frame, text=instructions, justify="left").pack(pady=20, padx=10)
 
-        brush_strength_value = ctk.CTkLabel(brush_frame, text="0.5")
-        brush_strength_value.grid(row=1, column=2, padx=5, pady=5)
-        self.brush_strength_value_label = brush_strength_value
+        # --- 3. PAINT TAB ---
+        painting_frame = ctk.CTkFrame(paint_tab, fg_color="transparent")
+        painting_frame.pack(pady=5, padx=5, fill="both", expand=True)
 
-        # Configure grid weights
-        brush_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(painting_frame, text="Paint Strength:").pack(padx=10, pady=(10, 0), anchor="w")
+        self.paint_strength_var = ctk.DoubleVar(value=0.2)
+        ctk.CTkSlider(painting_frame, from_=0.01, to=1.0, variable=self.paint_strength_var, command=self.update_paint_strength).pack(padx=10, fill="x")
+        self.paint_strength_value_label = ctk.CTkLabel(painting_frame, text="0.20")
+        self.paint_strength_value_label.pack(padx=10, anchor="e")
 
-        # Instructions
-        instructions_frame = ctk.CTkFrame(sculpting_frame)
-        instructions_frame.pack(pady=5, padx=10, fill="x")
+        slot_frame = ctk.CTkFrame(painting_frame)
+        slot_frame.pack(pady=15, padx=10, fill="x")
+        ctk.CTkLabel(slot_frame, text="Active Layer:").pack(side="left", padx=10)
+        self.active_texture_slot = ctk.IntVar(value=0)
+        ctk.CTkRadioButton(slot_frame, text="1", variable=self.active_texture_slot, value=0).pack(side="left", padx=5)
+        ctk.CTkRadioButton(slot_frame, text="2", variable=self.active_texture_slot, value=1).pack(side="left", padx=5)
+        ctk.CTkRadioButton(slot_frame, text="3", variable=self.active_texture_slot, value=2).pack(side="left", padx=5)
 
-        instructions_text = """Instructions:
-1. Select a terrain object first
-2. Enable terrain editing mode
-3. Left-click to raise terrain
-4. Shift + Left-click to lower terrain
-5. Adjust brush size and strength as needed"""
+        # Store UI elements to be able to access them later
+        self.paint_mode_buttons = []
+        self.texture_buttons = []
+        self.color_buttons = []
+        self.texture_file_labels = []
 
-        instructions_label = ctk.CTkLabel(instructions_frame, text=instructions_text,
-                                        justify="left", font=ctk.CTkFont(size=11))
-        instructions_label.pack(pady=10, padx=10)
+        for i in range(3):
+            layer_frame = ctk.CTkFrame(painting_frame)
+            layer_frame.pack(pady=5, padx=10, fill="x", expand=True)
+            layer_frame.grid_columnconfigure(1, weight=1)
+
+            ctk.CTkLabel(layer_frame, text=f"Layer {i+1}").grid(row=0, column=0, padx=(10, 5), pady=5, sticky="w")
+
+            mode_switch = ctk.CTkSegmentedButton(layer_frame, values=["Color", "Texture"],
+                                                 command=lambda mode, idx=i: self._on_paint_mode_change(idx, mode))
+            mode_switch.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+            mode_switch.set("Color") # Default
+            self.paint_mode_buttons.append(mode_switch)
+
+            # Frame for action buttons
+            action_frame = ctk.CTkFrame(layer_frame, fg_color="transparent")
+            action_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=2, sticky="ew")
+            action_frame.grid_columnconfigure(0, weight=1)
+            action_frame.grid_columnconfigure(1, weight=1)
+
+            color_btn = ctk.CTkButton(action_frame, text="Set Color", command=lambda idx=i: self.choose_terrain_slot_color(idx))
+            color_btn.grid(row=0, column=0, padx=(0,2), sticky="ew")
+            self.color_buttons.append(color_btn)
+
+            tex_btn = ctk.CTkButton(action_frame, text="Load Texture...", command=lambda idx=i: self.load_terrain_texture(idx), state="disabled")
+            tex_btn.grid(row=0, column=1, padx=(2,0), sticky="ew")
+            self.texture_buttons.append(tex_btn)
+
+            tex_label = ctk.CTkLabel(layer_frame, text="No Texture Loaded", font=("", 10), text_color="gray")
+            tex_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 5))
+            self.texture_file_labels.append(tex_label)
+
+        # Update the UI based on the currently selected object, if any
+        if self.gl_frame.selected_part_index is not None:
+             selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
+             if self._is_terrain_object(selected_obj):
+                 self._update_terrain_editor_ui(selected_obj)
 
     def toggle_terrain_editing(self):
         """Toggle terrain editing mode on/off."""
         enabled = self.terrain_editing_var.get()
 
         if enabled:
-            # Check if a terrain object is selected
             if (hasattr(self.gl_frame, 'selected_part_index') and
                 self.gl_frame.selected_part_index is not None):
 
                 selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
 
-                # Check if selected object is a terrain (plane mesh)
                 if self._is_terrain_object(selected_obj):
                     self.gl_frame.set_terrain_editing_mode(True, selected_obj)
+                    self._update_terrain_editor_ui(selected_obj) # Add this line
                     print("Terrain editing mode enabled")
                 else:
                     print("Please select a terrain object first")
@@ -3976,9 +4514,7 @@ class App(ctk.CTk):
             except ValueError:
                 pass  # Invalid input, ignore
 
-    def _is_terrain_object(self, obj):
-        """Check if object is a terrain object."""
-        return obj.get('name', '').startswith('Terrain_') or obj.get('is_terrain', False)
+
 
     def _is_terrain_editing_active(self):
         """Check if terrain editing tools are currently active."""
@@ -4848,11 +5384,19 @@ class App(ctk.CTk):
             vertices, faces, normals, texcoords, heightmap = self._generate_terrain_grid(x_size, y_size, resolution)
 
             # Store terrain-specific data for sculpting
+            num_vertices = vertices.shape[0]
+            blend_weights = np.zeros((num_vertices, 3), dtype=np.float32)
+            blend_weights[:, 0] = 1.0  # Default to first slot
+
             terrain_properties = {
                 'size_x': x_size,
                 'size_y': y_size,
                 'resolution': resolution,
                 'heightmap': heightmap,
+                'blend_weights': blend_weights,
+                'texture_files': [None, None, None],
+                'slot_colors': [[0.2, 0.6, 0.2, 1.0], [0.5, 0.5, 0.5, 1.0], [0.6, 0.4, 0.2, 1.0]],
+                'slot_modes': ['color', 'color', 'color'],
                 'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
             }
 
@@ -4909,7 +5453,7 @@ class App(ctk.CTk):
         self.pos_x_var, self.pos_y_var, self.pos_z_var = ctk.StringVar(), ctk.StringVar(), ctk.StringVar()
         self.rot_x_var, self.rot_y_var, self.rot_z_var = ctk.StringVar(), ctk.StringVar(), ctk.StringVar()
         self.scale_x_var, self.scale_y_var, self.scale_z_var = ctk.StringVar(), ctk.StringVar(), ctk.StringVar()
-        
+
         # --- Tracing vars to call update function ---
         for var in [self.pos_x_var, self.pos_y_var, self.pos_z_var,
                     self.rot_x_var, self.rot_y_var, self.rot_z_var,
@@ -4941,7 +5485,7 @@ class App(ctk.CTk):
         self.rot_y_entry = ctk.CTkEntry(rot_frame, textvariable=self.rot_y_var, width=120); self.rot_y_entry.grid(row=0,column=1,padx=2)
         self.rot_z_entry = ctk.CTkEntry(rot_frame, textvariable=self.rot_z_var, width=120); self.rot_z_entry.grid(row=0,column=2,padx=2)
         row += 1
-        
+
         # --- Scale ---
         ctk.CTkLabel(self.properties_frame, text="Scale").grid(row=row, column=0, padx=10, pady=2, sticky="w")
         scale_frame = ctk.CTkFrame(self.properties_frame, fg_color="transparent")
@@ -4956,24 +5500,21 @@ class App(ctk.CTk):
         material_label = ctk.CTkLabel(self.properties_frame, text="Material", font=ctk.CTkFont(weight="bold"))
         material_label.grid(row=row, column=0, columnspan=2, pady=(20, 5), sticky="w", padx=10)
         row += 1
-        
+
         # --- Color ---
         self.color_r_label = ctk.CTkLabel(self.properties_frame, text="R: -"); self.color_r_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
         self.color_r_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1, command=self.update_model_from_ui_callback); self.color_r_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew"); row += 1
-        
+
         self.color_g_label = ctk.CTkLabel(self.properties_frame, text="G: -"); self.color_g_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
         self.color_g_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1, command=self.update_model_from_ui_callback); self.color_g_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew"); row += 1
-        
+
         self.color_b_label = ctk.CTkLabel(self.properties_frame, text="B: -"); self.color_b_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
         self.color_b_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1, command=self.update_model_from_ui_callback); self.color_b_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew"); row += 1
 
-        # ---------- alpha (transparency) ----------  <-- NEW
-        self.alpha_label = ctk.CTkLabel(self.properties_frame, text="A: -")
-        self.alpha_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
-        self.alpha_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1,
-                                          command=self.update_model_from_ui_callback)
-        self.alpha_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew")
-        row += 1
+        # --- ADD THIS BLOCK FOR THE ALPHA SLIDER ---
+        self.color_a_label = ctk.CTkLabel(self.properties_frame, text="A: -"); self.color_a_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
+        self.color_a_slider = ctk.CTkSlider(self.properties_frame, from_=0, to=1, command=self.update_model_from_ui_callback); self.color_a_slider.grid(row=row, column=1, padx=10, pady=5, sticky="ew"); row += 1
+        # --- END OF BLOCK TO ADD ---
 
         # --- Actions Header ---
         actions_label = ctk.CTkLabel(self.properties_frame, text="Actions", font=ctk.CTkFont(weight="bold"))
@@ -4984,7 +5525,7 @@ class App(ctk.CTk):
         self.duplicate_button = ctk.CTkButton(self.properties_frame, text="Duplicate Object", command=self.duplicate_selected_object)
         self.duplicate_button.grid(row=row, column=0, columnspan=2, padx=10, pady=5, sticky="ew")
         row += 1
-        
+
         self.delete_button = ctk.CTkButton(self.properties_frame, text="Delete Object", command=self.delete_selected_object, fg_color="#D83C3C", hover_color="#A82727")
         self.delete_button.grid(row=row, column=0, columnspan=2, padx=10, pady=5, sticky="ew")
         row += 1
@@ -5033,36 +5574,16 @@ class App(ctk.CTk):
         self.mass_var.trace_add("write", self.update_mass_from_ui)
         row += 1
 
-        # --- Script Header ---
-        script_label = ctk.CTkLabel(self.properties_frame, text="Script", font=ctk.CTkFont(weight="bold"))
-        script_label.grid(row=row, column=0, columnspan=2, pady=(20, 5), sticky="w", padx=10)
-        row += 1
-
-        # Script File
-        script_file_label = ctk.CTkLabel(self.properties_frame, text="Script File:")
-        script_file_label.grid(row=row, column=0, padx=10, pady=2, sticky="w")
-
-        script_frame = ctk.CTkFrame(self.properties_frame, fg_color="transparent")
-        script_frame.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
-        script_frame.grid_columnconfigure(0, weight=1)
-
-        self.script_file_var = ctk.StringVar(value="None")
-        self.script_file_label = ctk.CTkLabel(script_frame, text="None", anchor="w")
-        self.script_file_label.grid(row=0, column=0, padx=2, sticky="ew")
-
-        self.add_script_button = ctk.CTkButton(script_frame, text="Add Script", width=80, command=self.add_script_to_object)
-        self.add_script_button.grid(row=0, column=1, padx=2)
-        row += 1
-
         # Store all interactive widgets to easily change their state
         self.interactive_widgets = [self.pos_x_entry, self.pos_y_entry, self.pos_z_entry,
                                     self.rot_x_entry, self.rot_y_entry, self.rot_z_entry,
                                     self.scale_x_entry, self.scale_y_entry, self.scale_z_entry,
                                     self.color_r_slider, self.color_g_slider, self.color_b_slider,
-                                    self.alpha_slider,   # <-- NEW
+                                    # --- ADD self.color_a_slider TO THIS LIST ---
+                                    self.color_a_slider,
                                     self.duplicate_button, self.delete_button,
                                     self.physics_none_radio, self.physics_static_radio, self.physics_rigidbody_radio,
-                                    self.physics_shape_menu, self.mass_entry, self.add_script_button]
+                                    self.physics_shape_menu, self.mass_entry]
 
     def set_properties_state(self, state):
         """Enable or disable all widgets in the properties panel."""
@@ -5097,49 +5618,7 @@ class App(ctk.CTk):
         self.gl_frame.delete_selected_part()
         self.gl_frame.focus_set()
 
-    def add_script_to_object(self):
-        """Opens a file dialog to select a script file for the selected object."""
-        if self.gl_frame.selected_part_index is None:
-            print("No object selected.")
-            return
 
-        # Open file dialog to select script file
-        from tkinter import filedialog
-        filepath = filedialog.askopenfilename(
-            title="Select Script File",
-            filetypes=[("Blob Script files", "*.blob"), ("All files", "*.*")]
-        )
-
-        if filepath:
-            # Convert to relative path for portability
-            try:
-                import os
-                relative_path = os.path.relpath(filepath)
-
-                # Update the selected object's script file
-                selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
-                selected_obj['script_file'] = relative_path
-
-                # Update the UI
-                self.script_file_var.set(relative_path)
-                self.script_file_label.configure(text=relative_path)
-
-                print(f"Script assigned to object: {relative_path}")
-
-            except Exception as e:
-                print(f"Error setting script file: {e}")
-        else:
-            # User cancelled or no file selected - option to remove script
-            if hasattr(self, 'gl_frame') and self.gl_frame.selected_part_index is not None:
-                selected_obj = self.gl_frame.model_draw_list[self.gl_frame.selected_part_index]
-                if selected_obj.get('script_file'):
-                    # Ask if user wants to remove the script
-                    import tkinter.messagebox as messagebox
-                    if messagebox.askyesno("Remove Script", "Do you want to remove the current script from this object?"):
-                        selected_obj['script_file'] = None
-                        self.script_file_var.set("None")
-                        self.script_file_label.configure(text="None")
-                        print("Script removed from object.")
 
     def new_scene(self):
         """Creates a new empty scene."""
@@ -5153,119 +5632,74 @@ class App(ctk.CTk):
             print("No objects in scene to save.")
             return
 
-        # Debug: Print current sun visibility state before saving
-        print(f"DEBUG: Saving sun_visible state: {self.sun_visible}")
-
         filepath = filedialog.asksaveasfilename(
             title="Save Scene As",
             defaultextension=".hamidmap",
             filetypes=[("HamidMap files", "*.hamidmap"), ("All files", "*.*")]
         )
-
         if not filepath:
             return
 
         try:
-            # Prepare scene data
             scene_data = {
-                "scene_info": {
-                    "name": os.path.splitext(os.path.basename(filepath))[0],
-                    "version": "1.0.0",
-                    "engine": "FreeFly Game Engine v10",
-                    "created_with": "FreeFly-glb-v10.py"
-                },
+                "scene_info": {"version": "1.4.0", "engine": "Hamid PY Engine V1.4"},
                 "camera": {
-                    "position": [float(x) for x in self.gl_frame.camera_pos.tolist()],
-                    "yaw": float(self.gl_frame.camera_yaw),
-                    "pitch": float(self.gl_frame.camera_pitch),
-                    "front": [float(x) for x in self.gl_frame.camera_front.tolist()],
-                    "up": [float(x) for x in self.gl_frame.camera_up.tolist()]
+                    "position": self.gl_frame.camera_pos.tolist(),
+                    "yaw": self.gl_frame.camera_yaw,
+                    "pitch": self.gl_frame.camera_pitch
                 },
                 "environment": {
-                    "sun_color": [float(x) for x in self.sun_color],
-                    "sky_color": [float(x) for x in self.sky_color],
-                    "halo_color": [float(x) for x in self.halo_color],
-                    "sun_visible": bool(self.sun_visible),
-                    "fog_auto_color": bool(self.fog_auto_color),
-                    "fog_manual_color": [float(x) for x in self.fog_manual_color]
+                    "sun_color": self.sun_color, "sky_color": self.sky_color,
+                    "halo_color": self.halo_color, "sun_visible": self.sun_visible,
+                    "fog_density": self.fog_density, "fog_gradient": self.fog_gradient
                 },
                 "objects": []
             }
 
-            # Save each object's data
-            for i, obj in enumerate(self.gl_frame.model_draw_list):
+            for obj in self.gl_frame.model_draw_list:
                 obj_data = {
-                    "id": i,
-                    "name": obj.get('name', f"Object_{i}"),
-                    "model_file": os.path.basename(obj.get('model_file', '')) if obj.get('model_file') else None,  # Store only filename
+                    "name": obj.get('name'), "model_file": obj.get('model_file'),
                     "transform": {
-                        "position": [float(x) for x in (obj['position'].tolist() if hasattr(obj['position'], 'tolist') else obj['position'])],
-                        "rotation": [float(x) for x in (obj['rotation'].tolist() if hasattr(obj['rotation'], 'tolist') else obj['rotation'])],  # In radians
-                        "scale": [float(x) for x in (obj['scale'].tolist() if hasattr(obj['scale'], 'tolist') else obj['scale'])]
+                        "position": obj['position'].tolist(),
+                        "rotation": obj['rotation'].tolist(),
+                        "scale": obj['scale'].tolist()
                     },
                     "material": {
-                        "base_color": [float(x) for x in obj['base_color_factor']],
-                        "is_transparent": bool(obj.get('is_transparent', False))
+                        "base_color": obj['base_color_factor'],
+                        # --- ADD THIS LINE ---
+                        "is_transparent": obj.get('is_transparent', False)
                     },
                     "physics": {
-                        "physics_type": obj.get('physics_type', 'None'),
-                        "physics_shape": obj.get('physics_shape', 'Cube'),
-                        "mass": float(obj.get('mass', 1.0))
+                        "type": obj.get('physics_type', 'None'),
+                        "shape": obj.get('physics_shape', 'Cube'),
+                        "mass": obj.get('mass', 1.0)
                     }
                 }
-
-                # Add script file if present
-                script_file = obj.get('script_file')
-                if script_file:
-                    obj_data["script_file"] = script_file
-
-                # Add terrain-specific data if this is a terrain object
-                if obj.get('is_terrain', False) or obj.get('name', '').startswith('Terrain_'):
-                    terrain_props = obj.get('terrain_properties')
-                    if terrain_props:
-                        # Save detailed terrain data including heightmap
-                        obj_data["terrain_data"] = {
-                            "is_terrain": True,
-                            "size_x_km": terrain_props['size_x'] / 1000.0,  # Convert meters to km
-                            "size_y_km": terrain_props['size_y'] / 1000.0,  # Convert meters to km
-                            "resolution": terrain_props['resolution'],
-                            "heightmap": terrain_props['heightmap'].tolist(),  # Save heightmap as list
-                            "terrain_color": obj['base_color_factor']
-                        }
-                    else:
-                        # Fallback for old terrain format
-                        name_parts = obj.get('name', '').replace('Terrain_', '').replace('km', '').split('x')
-                        if len(name_parts) == 2:
-                            try:
-                                terrain_x = float(name_parts[0])
-                                terrain_y = float(name_parts[1])
-                                obj_data["terrain_data"] = {
-                                    "is_terrain": True,
-                                    "size_x_km": terrain_x,
-                                    "size_y_km": terrain_y,
-                                    "terrain_color": obj['base_color_factor']
-                                }
-                            except ValueError:
-                                pass
-
-                # Add primitive-specific data if this is a primitive object
+                if obj.get('is_terrain'):
+                    props = obj['terrain_properties']
+                    obj_data["terrain_data"] = {
+                        "is_terrain": True,
+                        "size_x_km": props['size_x'] / 1000.0,
+                        "size_y_km": props['size_y'] / 1000.0,
+                        "resolution": props['resolution'],
+                        "heightmap": props['heightmap'].tolist(),
+                        "blend_weights": props['blend_weights'].tolist(),
+                        "texture_files": props.get('texture_files'),
+                        "slot_colors": props.get('slot_colors'),
+                        "slot_modes": props.get('slot_modes')
+                    }
                 if obj.get('is_primitive'):
                     obj_data["primitive_data"] = {
+                        # --- ADD THIS LINE ---
                         "is_primitive": True,
-                        "primitive_type": obj.get('primitive_type', 'cube')
+                        "type": obj.get('primitive_type'),
+                        "is_enemy": obj.get('is_enemy', False),
+                        "enemy_speed": obj.get('enemy_speed', 1.0)
                     }
-
-                    # Save enemy-specific properties if this is an enemy
-                    if obj.get('is_enemy', False):
-                        obj_data["primitive_data"]["is_enemy"] = True
-                        obj_data["primitive_data"]["enemy_speed"] = obj.get('enemy_speed', 1.0)
-
                 scene_data["objects"].append(obj_data)
 
-            # Write to TOML file
             with open(filepath, 'w') as f:
                 toml.dump(scene_data, f)
-
             print(f"Scene saved successfully to: {filepath}")
 
         except Exception as e:
@@ -5278,70 +5712,38 @@ class App(ctk.CTk):
             title="Load Scene",
             filetypes=[("HamidMap files", "*.hamidmap"), ("All files", "*.*")]
         )
-
         if not filepath:
             return
 
         try:
-            # Load TOML data
             with open(filepath, 'r') as f:
                 scene_data = toml.load(f)
 
-            # Clear current scene
             self.gl_frame._cleanup_old_model_resources()
 
-            # Restore camera position
-            if "camera" in scene_data:
-                cam_data = scene_data["camera"]
-                self.gl_frame.camera_pos = np.array(cam_data.get("position", [0, 1, 5]), dtype=np.float32)
-                self.gl_frame.camera_yaw = cam_data.get("yaw", -90.0)
-                self.gl_frame.camera_pitch = cam_data.get("pitch", 0.0)
-                self.gl_frame._update_camera_vectors()
+            cam = scene_data.get("camera", {})
+            self.gl_frame.camera_pos = np.array(cam.get("position", [0, 1, 5]), dtype=np.float32)
+            self.gl_frame.camera_yaw = cam.get("yaw", -90.0)
+            self.gl_frame.camera_pitch = cam.get("pitch", 0.0)
+            self.gl_frame._update_camera_vectors()
 
-            # Restore environment colors
-            if "environment" in scene_data:
-                env_data = scene_data["environment"]
-                self.sun_color = env_data.get("sun_color", [1.0, 1.0, 0.95, 1.0])
-                self.sky_color = env_data.get("sky_color", [0.53, 0.81, 0.92, 1.0])
-                self.halo_color = env_data.get("halo_color", [1.0, 0.9, 0.7, 0.15])
+            env = scene_data.get("environment", {})
+            self.sun_color = env.get("sun_color", [1.0, 0.9, 0.7, 1.0])
+            self.sky_color = env.get("sky_color", [0.6, 0.7, 0.9, 1.0])
+            self.halo_color = env.get("halo_color", [1.0, 0.9, 0.7, 0.15])
+            self.sun_visible = env.get("sun_visible", True)
+            self.fog_density = env.get("fog_density", 0.003)
+            self.fog_gradient = env.get("fog_gradient", 1.5)
+            self.sun_visible_var.set(self.sun_visible)
+            self.toggle_sun_visibility()
 
-                # Restore fog color settings
-                self.fog_auto_color = env_data.get("fog_auto_color", True)
-                self.fog_manual_color = env_data.get("fog_manual_color", [0.6, 0.7, 0.9, 1.0])
-                print(f"Loading fog settings - Auto: {self.fog_auto_color}, Manual color: {self.fog_manual_color}")
-
-                # Restore sun visibility state
-                self.sun_visible = env_data.get("sun_visible", True)
-                print(f"Loading sun visibility state: {self.sun_visible}")
-
-                # Update checkbox if it exists
-                if hasattr(self, 'sun_visible_var') and self.sun_visible_var is not None:
-                    try:
-                        self.sun_visible_var.set(self.sun_visible)
-                        print(f"Updated checkbox to: {self.sun_visible}")
-                    except Exception as e:
-                        print(f"Error updating checkbox: {e}")
-
-                # Update button states
-                try:
-                    self.toggle_sun_visibility()
-                except Exception as e:
-                    print(f"Warning: Could not update sun button states: {e}")
-                    self.sun_visible = True
-
-                # Sky color will be applied automatically in the next frame render
-
-            # Load objects
             if "objects" in scene_data:
                 for obj_data in scene_data["objects"]:
                     self._load_object_from_data(obj_data)
 
-            # Update UI and refresh
             self.gl_frame.model_loaded = True
-            self.gl_frame._update_properties_panel()
             self.update_hierarchy_list()
-            # Rendering will be handled by animate_task automatically
-
+            self.gl_frame._update_properties_panel()
             print(f"Scene loaded successfully from: {filepath}")
 
         except Exception as e:
@@ -5359,10 +5761,10 @@ class App(ctk.CTk):
                 return
 
             # Check if this is primitive data
-            primitive_data = obj_data.get('primitive_data')
-            if primitive_data and primitive_data.get('is_primitive'):
+            # --- CHANGE THIS LINE ---
+            if 'primitive_data' in obj_data:
                 # Recreate primitive from saved data
-                self._recreate_primitive_from_data(obj_data, primitive_data)
+                self._recreate_primitive_from_data(obj_data, obj_data['primitive_data'])
                 return
 
             model_file = obj_data.get('model_file')
@@ -5393,8 +5795,8 @@ class App(ctk.CTk):
 
                         # Restore physics properties
                         physics_data = obj_data.get('physics', {})
-                        new_obj['physics_type'] = physics_data.get('physics_type', 'None')
-                        new_obj['physics_shape'] = physics_data.get('physics_shape', 'Cube')
+                        new_obj['physics_type'] = physics_data.get('type', 'None')
+                        new_obj['physics_shape'] = physics_data.get('shape', 'Cube')
                         new_obj['mass'] = physics_data.get('mass', 1.0)
 
                         # Restore script file
@@ -5412,90 +5814,69 @@ class App(ctk.CTk):
             traceback.print_exc()
 
     def _recreate_terrain_from_data(self, obj_data, terrain_data):
-        """Recreate terrain from saved terrain data with heightmap support."""
+        """Recreate terrain from saved terrain data with heightmap and texture support."""
         try:
-            # Get terrain properties
-            x_size_km = terrain_data.get('size_x_km', 1.0)
-            y_size_km = terrain_data.get('size_y_km', 1.0)
-            terrain_color = terrain_data.get('terrain_color', [0.4, 0.6, 0.3, 1.0])
-            resolution = terrain_data.get('resolution', 157)  # Default to 157x157 grid (6x higher quality)
-            saved_heightmap = terrain_data.get('heightmap')
+            x_size = terrain_data['size_x_km'] * 1000.0
+            y_size = terrain_data['size_y_km'] * 1000.0
+            resolution = terrain_data['resolution']
 
-            # Convert km to meters
-            x_size = x_size_km * 1000.0
-            y_size = y_size_km * 1000.0
+            vertices, faces, normals, texcoords, heightmap = self._recreate_terrain_with_heightmap(
+                x_size, y_size, resolution, terrain_data['heightmap']
+            )
 
-            if saved_heightmap and resolution:
-                # Recreate terrain with saved heightmap
-                vertices, faces, normals, texcoords, heightmap = self._recreate_terrain_with_heightmap(
-                    x_size, y_size, resolution, saved_heightmap
-                )
+            blend_weights = np.array(terrain_data['blend_weights'], dtype=np.float32)
 
-                # Store terrain-specific data for sculpting
-                terrain_properties = {
-                    'size_x': x_size,
-                    'size_y': y_size,
-                    'resolution': resolution,
-                    'heightmap': heightmap,
-                    'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
-                }
-            else:
-                # Fallback: create new grid terrain (for old save files)
-                vertices, faces, normals, texcoords, heightmap = self._generate_terrain_grid(x_size, y_size, resolution)
+            terrain_properties = {
+                'size_x': x_size, 'size_y': y_size, 'resolution': resolution,
+                'heightmap': heightmap, 'blend_weights': blend_weights,
+                'texture_files': terrain_data.get('texture_files', [None, None, None]),
+                'slot_colors': terrain_data.get('slot_colors', [[0.2,0.6,0.2,1],[0.5,0.5,0.5,1],[0.6,0.4,0.2,1]]),
+                'slot_modes': terrain_data.get('slot_modes', ['color', 'color', 'color']),
+                'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
+            }
 
-                terrain_properties = {
-                    'size_x': x_size,
-                    'size_y': y_size,
-                    'resolution': resolution,
-                    'heightmap': heightmap,
-                    'vertex_spacing': x_size / (resolution - 1) if resolution > 1 else x_size
-                }
-
-            # Create terrain object with sculpting support
             recreated_terrain = {
-                'name': obj_data.get('name', f"Terrain_{x_size_km:.1f}x{y_size_km:.1f}km"),
-                'vertices': vertices,
-                'faces': faces,
-                'normals': normals,
-                'texcoords': texcoords,
+                'name': obj_data.get('name'),
+                'vertices': vertices, 'faces': faces, 'normals': normals, 'texcoords': texcoords,
                 'position': np.array(obj_data['transform']['position'], dtype=np.float32),
                 'rotation': np.array(obj_data['transform']['rotation'], dtype=np.float32),
                 'scale': np.array(obj_data['transform']['scale'], dtype=np.float32),
-                'base_color_factor': terrain_color,
-                'is_transparent': obj_data['material'].get('is_transparent', False),
-                'vertex_colors': None,
-                'pil_image_ref': None,
-                'model_file': None,
-                'terrain_properties': terrain_properties,  # Add terrain-specific data
-                'is_terrain': True  # Mark as terrain for identification
+                'base_color_factor': obj_data['material']['base_color'],
+                # --- CHANGE THIS LINE ---
+                'is_transparent': obj_data['material'].get('is_transparent', False), 'vertex_colors': None, 'pil_image_ref': None,
+                'model_file': None, 'terrain_properties': terrain_properties, 'is_terrain': True
             }
 
-            # Restore physics properties
             physics_data = obj_data.get('physics', {})
-            recreated_terrain['physics_type'] = physics_data.get('physics_type', 'None')
-            recreated_terrain['physics_shape'] = physics_data.get('physics_shape', '2DPlane')
-            recreated_terrain['mass'] = physics_data.get('mass', 1.0)
+            recreated_terrain.update({
+                'physics_type': physics_data.get('type', 'None'),
+                'physics_shape': physics_data.get('shape', '2DPlane'),
+                'mass': physics_data.get('mass', 1.0)
+            })
 
-            # Restore script file
-            script_file = obj_data.get('script_file')
-            recreated_terrain['script_file'] = script_file
-
-            # Add to scene
             self.gl_frame.model_draw_list.append(recreated_terrain)
 
-            if saved_heightmap:
-                print(f"Successfully recreated terrain with heightmap: {x_size_km:.1f}km x {y_size_km:.1f}km")
-            else:
-                print(f"Successfully recreated terrain (new grid): {x_size_km:.1f}km x {y_size_km:.1f}km")
+            for i, filepath in enumerate(terrain_properties['texture_files']):
+                if filepath and os.path.exists(filepath):
+                    try:
+                        with Image.open(filepath) as pil_image:
+                            self.gl_frame.set_terrain_texture(i, pil_image.copy())
+                        print(f"Reloaded texture for slot {i+1} from {filepath}")
+                    except Exception as e:
+                        print(f"Failed to reload texture from {filepath}: {e}")
+                else:
+                    self.gl_frame.set_terrain_texture(i, None)
+
+            print(f"Successfully recreated terrain: {recreated_terrain['name']}")
 
         except Exception as e:
-            print(f"Error recreating terrain: {e}")
+            print(f"Error recreating terrain from data: {e}")
             traceback.print_exc()
 
     def _recreate_primitive_from_data(self, obj_data, primitive_data):
         """Recreate primitive from saved primitive data."""
         try:
-            primitive_type = primitive_data.get('primitive_type', 'cube')
+            primitive_type = primitive_data.get('type', 'cube')
 
             # Create the appropriate primitive mesh
             if primitive_type == 'cube':
@@ -5508,6 +5889,7 @@ class App(ctk.CTk):
                 mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
             elif primitive_type == 'capsule':
                 mesh = trimesh.creation.capsule(radius=0.5, height=2.0, count=[32, 16])
+            # --- THIS IS THE CRITICAL FIX ---
             elif primitive_type == 'enemy':
                 # Enemies are capsule-shaped
                 mesh = trimesh.creation.capsule(radius=0.5, height=2.0, count=[32, 16])
@@ -5536,8 +5918,8 @@ class App(ctk.CTk):
 
                 # Restore physics properties
                 physics_data = obj_data.get('physics', {})
-                new_obj['physics_type'] = physics_data.get('physics_type', 'None')
-                new_obj['physics_shape'] = physics_data.get('physics_shape', 'Cube')
+                new_obj['physics_type'] = physics_data.get('type', 'None')
+                new_obj['physics_shape'] = physics_data.get('shape', 'Cube')
                 new_obj['mass'] = physics_data.get('mass', 1.0)
 
                 # Restore script file
